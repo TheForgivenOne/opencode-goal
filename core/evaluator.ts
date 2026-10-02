@@ -535,10 +535,11 @@ async function resolveLocation(
  * per-turn counters (`tokensSpentDelta`, `toolUsedThisTurn`) and terminal
  * bookkeeping. Any failure throws, which the loop maps to E8.
  *
- * `onWarning` is the emission channel available in this phase (the RPC
- * registration is a later phase): it receives model-resolution warnings. The
- * T-2 cross-provider message is exposed as {@link crossProviderWarning} for the
- * loop to emit once at goal set.
+ * `onWarning` is the emission channel: it receives model-resolution warnings.
+ * The RPC registration named in an earlier version was removed in the
+ * zero-import rewrite, so warnings surface as synthetic transcript entries.
+ * The T-2 cross-provider message is exposed as {@link crossProviderWarning} for
+ * the loop to emit once at goal set.
  */
 export async function evaluate(
   goalSessionID: string,

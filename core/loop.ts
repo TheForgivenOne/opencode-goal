@@ -72,7 +72,11 @@ export interface LoopWarningPayload {
   readonly reason: string;
 }
 
-/** Emission channels wired to the RPC registration by `index.ts`. */
+/**
+ * Emission channels. The RPC path was removed in the zero-import rewrite
+ * (local plugins cannot resolve bare specifiers), so warnings surface as
+ * synthetic transcript entries instead.
+ */
 export interface LoopNotifications {
   readonly changed?: (payload: LoopChangedPayload) => void;
   readonly warning?: (payload: LoopWarningPayload) => void;

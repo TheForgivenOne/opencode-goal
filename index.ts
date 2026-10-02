@@ -1,11 +1,30 @@
 /**
- * The `/goal` server entrypoint (spec §2, §6.1, §3).
+ * The `/goal` server entrypoint (spec §2, §3, §6.1, §8).
  *
- * `Plugin.define({ id, setup })`. Setup registers the `/goal` command, the RPC
- * definition, and the event watchers. It returns a `Cleanup` that disposes the
- * registrations, aborts every live loop, and removes the scratch evaluator
- * sessions. It **never starts a loop at setup**: after a reload the goal remains
- * set but dormant (E11) and is resumed by the next human prompt (AC-33).
+ * **Zero-import shape.** Plain `export default { id, setup }` — the shape round
+ * 1's spike proved loads and round 2 proved can register a command via
+ * `ctx.command.transform`. It is deliberately **not** `Plugin.define`, and it
+ * imports **no bare specifier**. A plugin loaded from a local directory cannot
+ * resolve bare specifiers (`@opencode/plugin`, `effect`): the resolution base is
+ * the binary's own module graph, not the plugin directory, so any such import
+ * makes the plugin fail to load and the loader retries on every request
+ * (progress.md, "INCIDENT" and "The architectural blocker — local plugins cannot
+ * import"). Only relative imports into `core/` are used here.
+ *
+ * **RPC is out of v1.** `ctx.rpc.register` requires a portable definition built
+ * with the effect `Schema` module, which is unreachable from this shape. The
+ * loop, the `/goal` command and the event watchers remain; the TUI half drops
+ * out with the RPC bridge.
+ *
+ * Setup registers the `/goal` command and the event watchers, then returns a
+ * `Cleanup` that disposes the registrations, aborts every live loop, and removes
+ * the scratch evaluator sessions. It **never starts a loop at setup**: after a
+ * reload the goal remains set but dormant (E11) and is resumed by the next human
+ * prompt (AC-33).
+ *
+ * Setup is **defensive**: on a runtime where the context lacks a domain this
+ * plugin needs, it logs and returns rather than throwing. A throw at load time
+ * is not free on this runtime.
  *
  * G-4 defense. It was never verified what `invocation.prompt.text` contains when
  * arguments are supplied. Two readings are defended against:
@@ -24,10 +43,6 @@
  * that `execute` returns the output string.
  */
 
-import { Plugin } from "@opencode/plugin";
-import type { RpcRegistration } from "@opencode/plugin/promise/rpc";
-import { Schema } from "effect";
-
 import {
   abortAll,
   clearGoal,
@@ -35,17 +50,12 @@ import {
   notePermissionAsk,
   noteToolUse,
   onSessionDeleted,
-  resolveConfig,
   startGoal,
   stopSessionForNewConversation,
   type GoalLoopDeps,
-  type LoopNotifications,
+  type LoopContext,
 } from "./core/loop";
-import {
-  formatEvaluatorModel,
-  removeEvaluatorSession,
-  resolveEvaluatorModel,
-} from "./core/evaluator";
+import { removeEvaluatorSession } from "./core/evaluator";
 import {
   clearConfirmation,
   parseGoalArg,
@@ -53,49 +63,74 @@ import {
   tooLongMessage,
 } from "./core/parser";
 import { readGoal, scanGoals } from "./core/store";
-import { installWatchers } from "./core/watch";
-import { goalRpc } from "./rpc";
+import { installWatchers, type WatchContext } from "./core/watch";
 
 // ---------------------------------------------------------------------------
-// RPC portability
+// Local structural typing (no bare imports)
 // ---------------------------------------------------------------------------
-//
-// `Rpc.define` accepts Effect `Schema` values (via `Tool.ValueSchema`), but the
-// shipped `RpcDomain.register` is constrained to `Rpc.PortableDefinition`, whose
-// method/event schemas must be `StandardSchemaV1 | JsonSchema`. Effect schemas
-// are not structurally `StandardSchemaV1` (they carry no `~standard` until
-// converted), so the definition is converted with `Schema.toStandardSchemaV1`
-// before registration. This is a divergence from the contracts document's
-// worked example (§4e), which passes raw Effect schemas to `register`; the
-// installed `.d.ts` rejects that.
 
-type PortableInputSchema = Parameters<typeof Schema.toStandardSchemaV1>[0];
-
-function toPortable<const S extends PortableInputSchema>(schema: S) {
-  return Schema.toStandardSchemaV1(schema);
+/**
+ * The command-invocation fields this entrypoint reads (spec §6.1). Declared
+ * locally so the file needs no `@opencode/plugin` import; the shipped
+ * `CommandInvocation` is `{ sessionID, prompt, delivery }`.
+ */
+interface GoalCommandInvocation {
+  readonly sessionID: string;
+  readonly prompt?: { readonly text?: string } | undefined;
 }
 
-const portableGoalRpc = {
-  id: goalRpc.id,
-  methods: {
-    status: {
-      input: toPortable(goalRpc.methods.status.input),
-      output: toPortable(goalRpc.methods.status.output),
-    },
-    clear: {
-      input: toPortable(goalRpc.methods.clear.input),
-      output: toPortable(goalRpc.methods.clear.output),
-    },
-    config: {
-      input: toPortable(goalRpc.methods.config.input),
-      output: toPortable(goalRpc.methods.config.output),
-    },
-  },
-  events: {
-    changed: { schema: toPortable(goalRpc.events.changed.schema) },
-    warning: { schema: toPortable(goalRpc.events.warning.schema) },
-  },
-};
+interface GoalCommandEditor {
+  add(definition: {
+    readonly name: string;
+    readonly description?: string;
+    readonly execute: (input: GoalCommandInvocation) => Promise<void>;
+  }): void;
+}
+
+interface GoalCommandContext {
+  readonly transform: (
+    callback: (editor: GoalCommandEditor) => void,
+  ) => Promise<{ readonly dispose: () => Promise<void> }>;
+}
+
+/**
+ * The slice of the plugin context this entrypoint uses. `LoopContext` and
+ * `WatchContext` come from `core/`, whose domain types derive from the shipped
+ * `@opencode/plugin` types via **type-only** imports. Type-only imports are
+ * erased at runtime, so they add no bare specifier to this module's load graph.
+ */
+type GoalSetupContext = LoopContext & WatchContext & { readonly command: GoalCommandContext };
+
+/** A plugin cleanup, matching the shipped `Cleanup` shape. */
+type Cleanup = () => Promise<void> | void;
+
+/** Domains this plugin needs; a missing one is reported, never thrown over. */
+const REQUIRED_DOMAINS = ["location", "session", "model", "storage", "command", "event"] as const;
+
+/**
+ * Return the names of required domains absent (or unusable) on `ctx`. Runtime
+ * guard only — the static type says they exist; the runtime is what matters.
+ */
+function missingDomains(ctx: unknown): string[] {
+  const record = (ctx ?? {}) as Record<string, unknown>;
+  const missing: string[] = [];
+  for (const name of REQUIRED_DOMAINS) {
+    const value = record[name];
+    if (value === undefined || value === null) {
+      missing.push(name);
+      continue;
+    }
+    // For the two domains we call a method on, requiring the method is more
+    // honest than merely requiring the domain object.
+    if (name === "command" && typeof (value as { transform?: unknown }).transform !== "function") {
+      missing.push(name);
+    }
+    if (name === "event" && typeof (value as { subscribe?: unknown }).subscribe !== "function") {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
 
 // ---------------------------------------------------------------------------
 // Command-argument handling (G-4)
@@ -168,22 +203,19 @@ async function statusText(sessionID: string, deps: GoalLoopDeps): Promise<string
 // Plugin definition
 // ---------------------------------------------------------------------------
 
-export default Plugin.define({
+export default {
   id: "opencode-goal",
-  async setup(ctx) {
+  async setup(ctx: GoalSetupContext): Promise<Cleanup | void> {
+    const missing = missingDomains(ctx);
+    if (missing.length > 0) {
+      console.warn(
+        `[goal] setup skipped: plugin context is missing ${missing.join(", ")}; no command or watcher installed.`,
+      );
+      return;
+    }
+
     const rootDir = String(ctx.location.directory);
-    let rpcRegistration: RpcRegistration<typeof portableGoalRpc> | undefined;
-
-    const notify: LoopNotifications = {
-      changed: (payload) => {
-        void rpcRegistration?.events.emit("changed", payload).catch(() => {});
-      },
-      warning: (payload) => {
-        void rpcRegistration?.events.emit("warning", payload).catch(() => {});
-      },
-    };
-
-    const deps: GoalLoopDeps = { ctx, rootDir, notify };
+    const deps: GoalLoopDeps = { ctx, rootDir };
 
     // Emit the exact command-output strings as synthetic transcript entries. These
     // must not start a turn (AC-8), hence `resume:false`.
@@ -194,69 +226,6 @@ export default Plugin.define({
         // Best-effort command output; never fail the command on delivery.
       }
     };
-
-    // --- RPC registration (spec §6.2). Degrades gracefully if unavailable. ---
-    try {
-      rpcRegistration = await ctx.rpc.register(portableGoalRpc, {
-        status: async (input) => {
-          const { record } = await readGoal(input.sessionID, deps.ctx);
-          if (record === null) return { kind: "none" as const };
-          const now = Date.now();
-          const base = {
-            condition: record.condition,
-            turnsEvaluated: record.turnsEvaluated,
-            tokensSpent: record.tokensSpent,
-            lastReason: record.lastReason,
-            state: record.state,
-          };
-          if (record.state === "active") {
-            return { kind: "active" as const, ...base, elapsedMs: now - record.setAt };
-          }
-          return {
-            kind: record.state === "achieved" ? ("achieved" as const) : ("failed" as const),
-            ...base,
-            elapsedMs: (record.endedAt ?? now) - record.setAt,
-          };
-        },
-        clear: async (input) => {
-          const result = await clearGoal(input.sessionID, deps);
-          return {
-            cleared: result.cleared,
-            ...(result.condition !== undefined ? { condition: result.condition } : {}),
-            message:
-              result.cleared && result.condition !== undefined
-                ? clearConfirmation(result.condition)
-                : STATUS_NO_GOAL,
-          };
-        },
-        config: async () => {
-          const { config } = resolveConfig(rootDir);
-          let resolvedEvaluatorModel: string | undefined;
-          let evaluatorProvider: string | undefined;
-          try {
-            const resolved = await resolveEvaluatorModel(undefined, config, ctx);
-            if (resolved.model !== undefined) {
-              resolvedEvaluatorModel = formatEvaluatorModel(resolved.model);
-              evaluatorProvider = resolved.model.providerID;
-            }
-          } catch {
-            // Read-only surface; resolution failure leaves the fields absent.
-          }
-          return {
-            antiSpinThreshold: config.antiSpinThreshold,
-            turnCap: config.turnCap,
-            ...(config.evaluatorModel !== undefined ? { evaluatorModel: config.evaluatorModel } : {}),
-            ...(resolvedEvaluatorModel !== undefined ? { resolvedEvaluatorModel } : {}),
-            ...(evaluatorProvider !== undefined ? { evaluatorProvider } : {}),
-            permissiveModePolicy: config.permissiveModePolicy,
-          };
-        },
-      });
-    } catch {
-      // RPC unavailable (the round-2 spike observed it blocked): the loop and
-      // command still work; the TUI bridge is simply absent.
-      rpcRegistration = undefined;
-    }
 
     // --- `/goal` command (spec §6.1). ---
     const commandRegistration = await ctx.command.transform((editor) => {
@@ -331,11 +300,6 @@ export default Plugin.define({
       } catch {
         // Disposal is best-effort.
       }
-      try {
-        await rpcRegistration?.dispose();
-      } catch {
-        // Disposal is best-effort.
-      }
       // Remove scratch evaluator sessions for any surviving (dormant) record.
       try {
         const { goals } = await scanGoals(ctx);
@@ -347,4 +311,4 @@ export default Plugin.define({
       }
     };
   },
-});
+};

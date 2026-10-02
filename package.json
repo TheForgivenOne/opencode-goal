@@ -1,0 +1,17 @@
+{
+  "name": "opencode-goal",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode V2 /goal plugin — an autonomous goal-directed loop.",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
+  },
+  "server": "./index.ts",
+  "tui": "./tui.tsx",
+  "rpc": "./rpc.ts",
+  "dependencies": {
+    "@opencode/plugin": "2.0.22"
+  }
+}

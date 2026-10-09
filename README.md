@@ -1,9 +1,16 @@
 # opencode-goal
 
+[![test](https://github.com/TheForgivenOne/opencode-goal/actions/workflows/test.yml/badge.svg)](https://github.com/TheForgivenOne/opencode-goal/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `/goal` for OpenCode V2 — set a completion condition, and the agent works
 toward it in unattended turns until a model judges the condition met.
 
 Ported from Claude Code's `/goal`.
+
+You set the finish line once. Instead of you prompting, checking, and prompting
+again, the loop keeps the agent working and asks a **separate evaluator model**
+whether you're there yet.
 
 ## Install
 
@@ -31,6 +38,61 @@ should show it.
 The loop starts turns on its own. It stops when the condition is judged **met**
 (goal achieved), **impossible**, or a guard fires — and it stays dormant after
 that, resuming on your next message.
+
+## How it works
+
+```
+  /goal "tests pass"          the condition is stored, state = active
+        │
+        ▼
+  inject a directive ───────► schedules one turn for the agent
+        │                          │
+        │                          ▼
+        │                    the agent takes the turn
+        ▼                          │
+  wait for the turn to end ◄───────┘
+        │
+        ▼
+  EVALUATE ──► a tool-less scratch session, a separate evaluator model
+               transcript + your condition  ──►  MET | IMPOSSIBLE | NOT YET MET
+        │
+        ├── MET / IMPOSSIBLE ──► done: the goal is achieved, or ruled out
+        │
+        └── NOT YET MET ──► inject the next directive ──┐
+                                                         │
+                            └────────────────────────────┘
+```
+
+Three decisions worth knowing:
+
+1. **Directives are sent as synthetic messages, not prompts.** That is what makes
+   *your* messages distinguishable from the loop's: a real user message means a
+   human spoke, so the counters reset and the loop gets a fresh budget.
+2. **Evaluation runs in its own tool-less session** (`goal-evaluator:<session>`),
+   so the evaluator never touches your repo and never contaminates the working
+   session's context.
+3. **The evaluator is a separate model, picked automatically** — preferring
+   available paid models over free ones, excluding the model the working session
+   is using, and falling back to the next candidate when one is deprecated or
+   unusable.
+
+`IMPOSSIBLE` is deliberately narrow: it means the transcript already establishes
+that the condition can never hold. Being large, slow, expensive, or needing many
+turns is **not** impossible — the loop accumulates work across turns.
+
+## What stops it
+
+| Stop | When | Result |
+|---|---|---|
+| verdict | evaluator says MET or IMPOSSIBLE | resolved |
+| anti-spin | N turns in a row with **no tool call at all** | stops, goal stays set |
+| turn cap | N turns started by the loop | stops, goal stays set |
+| `/goal clear` | you ask | goal removed |
+| kill switch | `OPENCODE_GOAL_DISABLE=1` or `.opencode/goal.kill` | stops, goal stays set |
+| evaluator failure | transport or unexpected error | stops, goal stays set |
+
+Every stop except the first **leaves the goal set but dormant** — your next
+message resumes it.
 
 ## Configuration
 

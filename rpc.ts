@@ -12,8 +12,9 @@
  *
  * T-8: `setConfig` is deliberately absent. The RPC exposes no mutator of the
  * feature's own safety limits — only `status`, `clear` (authority-reducing) and
- * read-only `config`. Those limits are set only through the file/env surface of
- * spec §9.
+ * read-only `config`. Those limits are set only through the configuration
+ * surface of spec §9: `ctx.options`, `.opencode/goal.json`, then the
+ * `OPENCODE_GOAL_*` environment (lowest to highest).
  *
  * NOTE (2026-10-09): was deleted during the zero-import rewrite under a ruling
  * that has since been RETRACTED — bare specifiers DO resolve from a discovered
@@ -58,6 +59,10 @@ export const goalRpc = Rpc.define({
         resolvedEvaluatorModel: Schema.optional(Schema.String),
         evaluatorProvider: Schema.optional(Schema.String),
         permissiveModePolicy: Schema.String,
+        /** Cost/egress caps (spec §9), added 2026-10-09. */
+        transcriptMaxMessageChars: Schema.Number,
+        transcriptMaxTotalChars: Schema.Number,
+        evaluatorMaxAttempts: Schema.Number,
       }),
     },
   },

@@ -28,7 +28,8 @@ import { join } from "node:path";
 
 import type { Plugin } from "@opencode/plugin";
 import {
-  loadConfig,
+  DISABLE_ENV,
+  resolveConfigFrom,
   type ConfigLoadResult,
   type RawConfig,
 } from "./config";
@@ -89,6 +90,12 @@ export interface GoalLoopDeps {
   readonly ctx: LoopContext;
   /** Workspace root: config at `<root>/.opencode/goal.json`, sentinel at `<root>/.opencode/goal.kill`. */
   readonly rootDir: string;
+  /**
+   * `ctx.options` from the plugin entry — the documented V2 option channel
+   * (`{ "plugins": [{ "package": "opencode-goal", "options": { … } }] }`). It is the
+   * lowest of the explicit configuration layers (spec §9).
+   */
+  readonly pluginOptions?: unknown;
   readonly notify?: LoopNotifications;
   /** Injection seam: a loop **directive** (schedules a turn). Defaults to `session.synthetic`. */
   readonly injectDirective?: TextInjection;
@@ -367,7 +374,7 @@ async function driveLoop(
       }
 
       // §8.6 permission gate: refuses only on positive evidence of permissive.
-      const gateCfg = resolveConfig(deps.rootDir).config;
+      const gateCfg = resolveConfig(deps.rootDir, deps.pluginOptions).config;
       if (run.permissionMode === "permissive") {
         if (gateCfg.permissiveModePolicy === "refuse") {
           await warn(deps, sessionID, permissiveRefusalWarning());
@@ -394,7 +401,7 @@ async function driveLoop(
       record = await annotateTurn(record, run, deps, sessionID);
 
       // Hard cap, before evaluation (AC-34, §4.2 ordering).
-      const cfg = resolveConfig(deps.rootDir).config;
+      const cfg = resolveConfig(deps.rootDir, deps.pluginOptions).config;
       if (record.turnsThisRun >= cfg.turnCap && run.turnStartedByLoop) {
         await warn(deps, sessionID, capWarning(cfg.turnCap));
         break;
@@ -580,13 +587,17 @@ function unexpectedLoopWarning(err: unknown): string {
 }
 
 /**
- * Read config from the environment and `<root>/.opencode/goal.json`, then validate
- * (spec §9). Resolution order: env → file → defaults. Never throws; a malformed
- * file yields defaults plus a warning (AC-39).
+ * Read config from `ctx.options`, the environment and `<root>/.opencode/goal.json`,
+ * then validate (spec §9). Never throws; a malformed file yields a warning and the
+ * other layers still apply (AC-39).
+ *
+ * Precedence, lowest → highest: defaults → `ctx.options` → `goal.json` → environment.
+ * The layering and validation live in {@link resolveConfigFrom}; this function only
+ * performs the I/O (read the file, read `process.env`).
  */
-export function resolveConfig(rootDir: string): ConfigLoadResult {
+export function resolveConfig(rootDir: string, pluginOptions?: unknown): ConfigLoadResult {
   const warnings: string[] = [];
-  const raw: RawConfig = {};
+  let file: unknown;
 
   const filePath = join(rootDir, ".opencode", "goal.json");
   try {
@@ -595,15 +606,15 @@ export function resolveConfig(rootDir: string): ConfigLoadResult {
       try {
         const parsed: unknown = JSON.parse(text);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          Object.assign(raw, parsed as RawConfig);
+          file = parsed;
         } else {
           warnings.push(
-            `Invalid goal config ${filePath}: expected a JSON object; using defaults and environment.`,
+            `Invalid goal config ${filePath}: expected a JSON object; using plugin options, environment and defaults.`,
           );
         }
       } catch (err) {
         warnings.push(
-          `Invalid goal config ${filePath}: ${describeError(err)}; using defaults and environment.`,
+          `Invalid goal config ${filePath}: ${describeError(err)}; using plugin options, environment and defaults.`,
         );
       }
     }
@@ -611,37 +622,17 @@ export function resolveConfig(rootDir: string): ConfigLoadResult {
     warnings.push(`Could not read goal config ${filePath}: ${describeError(err)}`);
   }
 
-  applyEnvOverride(raw, "OPENCODE_GOAL_ANTISPIN", "antiSpinThreshold", true);
-  applyEnvOverride(raw, "OPENCODE_GOAL_TURNCAP", "turnCap", true);
-  applyEnvOverride(raw, "OPENCODE_GOAL_EVAL_MODEL", "evaluatorModel", false);
-  applyEnvOverride(raw, "OPENCODE_GOAL_PERMISSIVE", "permissiveModePolicy", false);
-
-  const result = loadConfig(raw);
+  const result = resolveConfigFrom({
+    options: pluginOptions,
+    file,
+    env: typeof process === "undefined" ? undefined : process.env,
+  });
   return { config: result.config, warnings: [...warnings, ...result.warnings] };
-}
-
-function applyEnvOverride(
-  raw: RawConfig,
-  envName: string,
-  key: keyof RawConfig,
-  numeric: boolean,
-): void {
-  if (typeof process === "undefined" || process.env === undefined) return;
-  const value = process.env[envName];
-  if (value === undefined) return;
-  if (numeric) {
-    const parsed = Number(value);
-    // A non-numeric/empty value is passed through as a string so `loadConfig`
-    // rejects it with a named warning rather than silently coercing.
-    raw[key] = value.trim() !== "" && Number.isFinite(parsed) ? parsed : value;
-  } else {
-    raw[key] = value;
-  }
 }
 
 /** `OPENCODE_GOAL_DISABLE=1` or `<root>/.opencode/goal.kill` exists (spec §8.5). */
 export function outOfBandStop(deps: Pick<GoalLoopDeps, "rootDir">): boolean {
-  if (typeof process !== "undefined" && process.env?.OPENCODE_GOAL_DISABLE === "1") {
+  if (typeof process !== "undefined" && process.env?.[DISABLE_ENV] === "1") {
     return true;
   }
   return existsSync(join(deps.rootDir, ".opencode", "goal.kill"));
@@ -708,7 +699,7 @@ async function emitTerminal(
 }
 
 async function emitConfigWarnings(sessionID: string, deps: GoalLoopDeps): Promise<void> {
-  for (const message of resolveConfig(deps.rootDir).warnings) {
+  for (const message of resolveConfig(deps.rootDir, deps.pluginOptions).warnings) {
     await warn(deps, sessionID, message);
   }
 }
@@ -716,7 +707,7 @@ async function emitConfigWarnings(sessionID: string, deps: GoalLoopDeps): Promis
 /** T-2: warn once at goal set when the evaluator egresses to another provider. */
 async function emitProviderWarning(sessionID: string, deps: GoalLoopDeps): Promise<void> {
   try {
-    const cfg = resolveConfig(deps.rootDir).config;
+    const cfg = resolveConfig(deps.rootDir, deps.pluginOptions).config;
     const info = await deps.ctx.session.get({ sessionID });
     const workingModel: WorkingModelRef | undefined =
       info.model !== undefined

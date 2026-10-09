@@ -566,6 +566,9 @@ describe("resolveEvaluatorModel (spec §7.2 rules 1–3)", () => {
     turnCap: 50,
     evaluatorModel: undefined,
     permissiveModePolicy: "warn",
+    transcriptMaxMessageChars: 8000,
+    transcriptMaxTotalChars: 48000,
+    evaluatorMaxAttempts: 5,
     ...over,
   });
 
@@ -658,6 +661,7 @@ interface FakeEvalCtx {
 function evalCtx(
   models: SelectableModel[] = [],
   onGenerate?: (input: { sessionID: string; prompt: string }, callIndex: number) => { text: string },
+  contextMessages: unknown[] = [{ type: "user", text: "hello" }],
 ): FakeEvalCtx {
   const creates: Record<string, unknown>[] = [];
   const generates: { sessionID: string; prompt: string }[] = [];
@@ -685,7 +689,7 @@ function evalCtx(
         removes.push(sessionID);
         alive.delete(sessionID);
       },
-      context: async () => [{ type: "user", text: "hello" }],
+      context: async () => contextMessages,
       generate: async (input: { sessionID: string; prompt: string }) => {
         generates.push(input);
         if (onGenerate !== undefined) return onGenerate(input, generates.length - 1);
@@ -760,6 +764,9 @@ describe("evaluate (spec §7, AC-20/AC-21/AC-28)", () => {
       turnCap: 50,
       evaluatorModel: undefined,
       permissiveModePolicy: "warn",
+      transcriptMaxMessageChars: 8000,
+      transcriptMaxTotalChars: 48000,
+      evaluatorMaxAttempts: 5,
     };
     const verdict = await evaluate("goal-1", createGoal("the token BANANA is written"), cfg, ctx);
     expect(verdict).toEqual({ kind: "met", reason: "done" });
@@ -785,6 +792,9 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
     turnCap: 50,
     evaluatorModel: undefined,
     permissiveModePolicy: "warn",
+    transcriptMaxMessageChars: 8000,
+    transcriptMaxTotalChars: 48000,
+    evaluatorMaxAttempts: 5,
   };
 
   const twoCandidates = (): SelectableModel[] => [
@@ -966,5 +976,86 @@ describe("isModelUnusableError", () => {
     expect(isModelUnusableError("Model X has been deprecated.")).toBe(true);
     expect(isModelUnusableError(undefined)).toBe(false);
     expect(isModelUnusableError({ nope: 1 })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spec §9 — the cost/egress caps actually reach the evaluation
+// ---------------------------------------------------------------------------
+
+describe("evaluate — configured caps are used (spec §9)", () => {
+  beforeEach(() => clearEvaluatorSessionCache());
+
+  const baseCfg: ResolvedConfig = {
+    antiSpinThreshold: 3,
+    turnCap: 50,
+    evaluatorModel: undefined,
+    permissiveModePolicy: "warn",
+    transcriptMaxMessageChars: 8000,
+    transcriptMaxTotalChars: 48000,
+    evaluatorMaxAttempts: 5,
+  };
+
+  it("evaluatorMaxAttempts bounds the number of candidates tried", async () => {
+    const models = Array.from({ length: 7 }, (_, i) =>
+      model({ providerID: "p", modelID: `m${i}`, cost: [{ output: i + 1 }] }),
+    );
+    const { ctx, generates } = evalCtx(models, () => {
+      throw new Error("Model m0 has been retired.");
+    });
+    await expect(
+      evaluate("goal-1", createGoal("c"), { ...baseCfg, evaluatorMaxAttempts: 1 }, ctx),
+    ).rejects.toThrow("retired");
+    // The default is 5 (asserted elsewhere); the configured value must win.
+    expect(generates.length).toBe(1);
+  });
+
+  it("a larger evaluatorMaxAttempts is honoured too", async () => {
+    const models = Array.from({ length: 9 }, (_, i) =>
+      model({ providerID: "p", modelID: `m${i}`, cost: [{ output: i + 1 }] }),
+    );
+    const { ctx, generates } = evalCtx(models, () => {
+      throw new Error("Model m0 has been retired.");
+    });
+    await expect(
+      evaluate("goal-1", createGoal("c"), { ...baseCfg, evaluatorMaxAttempts: 8 }, ctx),
+    ).rejects.toThrow("retired");
+    expect(generates.length).toBe(8);
+  });
+
+  it("transcriptMaxMessageChars truncates a long message out of the prompt", async () => {
+    const tail = "TAIL_SENTINEL_SHOULD_BE_CUT";
+    const longMessage = { type: "user" as const, text: "A".repeat(2000) + tail };
+    const models = [model({ providerID: "ep", modelID: "em", cost: [{ output: 5 }] })];
+
+    const wide = evalCtx(models, undefined, [longMessage]);
+    await evaluate("goal-1", createGoal("c"), baseCfg, wide.ctx);
+    expect(wide.generates[0].prompt).toContain(tail);
+
+    clearEvaluatorSessionCache();
+    const narrow = evalCtx(models, undefined, [longMessage]);
+    await evaluate(
+      "goal-1",
+      createGoal("c"),
+      { ...baseCfg, transcriptMaxMessageChars: 300 },
+      narrow.ctx,
+    );
+    expect(narrow.generates[0].prompt).not.toContain(tail);
+    expect(narrow.generates[0].prompt.length).toBeLessThan(wide.generates[0].prompt.length);
+  });
+
+  it("transcriptMaxTotalChars drops older messages from the prompt", async () => {
+    const models = [model({ providerID: "ep", modelID: "em", cost: [{ output: 5 }] })];
+    const messages = [
+      { type: "user" as const, text: `OLDEST_SENTINEL ${"x".repeat(500)}` },
+      { type: "user" as const, text: `NEWEST_SENTINEL ${"y".repeat(500)}` },
+    ];
+
+    const { ctx, generates } = evalCtx(models, undefined, messages);
+    await evaluate("goal-1", createGoal("c"), { ...baseCfg, transcriptMaxTotalChars: 560 }, ctx);
+    const prompt = generates[0].prompt;
+    expect(prompt).toContain("NEWEST_SENTINEL");
+    expect(prompt).not.toContain("OLDEST_SENTINEL");
+    expect(prompt).toContain(TRANSCRIPT_TRUNCATION_MARKER);
   });
 });

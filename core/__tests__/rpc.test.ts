@@ -83,10 +83,19 @@ describe("goalRpc schemas validate at runtime (spec §6.2)", () => {
 
   it("config output validates and rejects a wrong-typed field", () => {
     const d = decode(goalRpc.methods.config.output);
-    expect(
-      d({ antiSpinThreshold: 3, turnCap: 50, permissiveModePolicy: "warn" }),
-    ).toEqual({ antiSpinThreshold: 3, turnCap: 50, permissiveModePolicy: "warn" });
-    expect(() => d({ antiSpinThreshold: "3", turnCap: 50, permissiveModePolicy: "warn" })).toThrow();
+    const valid = {
+      antiSpinThreshold: 3,
+      turnCap: 50,
+      permissiveModePolicy: "warn",
+      transcriptMaxMessageChars: 8000,
+      transcriptMaxTotalChars: 48000,
+      evaluatorMaxAttempts: 5,
+    };
+    expect(d(valid)).toEqual(valid);
+    expect(() => d({ ...valid, antiSpinThreshold: "3" })).toThrow();
+    // The cost/egress caps are part of the contract and typed too.
+    expect(() => d({ ...valid, evaluatorMaxAttempts: "5" })).toThrow();
+    expect(() => d({ ...valid, transcriptMaxTotalChars: null })).toThrow();
   });
 
   it("changed event schema accepts a valid payload and rejects a missing sessionID", () => {

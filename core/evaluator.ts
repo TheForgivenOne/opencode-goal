@@ -25,7 +25,7 @@
  */
 
 import type { Plugin } from "@opencode/plugin";
-import type { ResolvedConfig } from "./config";
+import { DEFAULT_CONFIG, type ResolvedConfig } from "./config";
 import { type GoalRecord, type Verdict, type VerdictKind } from "./record";
 
 // ---------------------------------------------------------------------------
@@ -43,10 +43,10 @@ export interface EvaluatorContext {
 // Transcript rendering (spec §7.4) — pure
 // ---------------------------------------------------------------------------
 
-/** Per-message cap, in characters (A-N3). */
-export const TRANSCRIPT_MAX_MESSAGE_CHARS = 8000;
-/** Total transcript budget, in characters (A-N3). */
-export const TRANSCRIPT_MAX_TOTAL_CHARS = 48000;
+/** Per-message cap, in characters (A-N3). Default source: `DEFAULT_CONFIG`. */
+export const TRANSCRIPT_MAX_MESSAGE_CHARS = DEFAULT_CONFIG.transcriptMaxMessageChars;
+/** Total transcript budget, in characters (A-N3). Default source: `DEFAULT_CONFIG`. */
+export const TRANSCRIPT_MAX_TOTAL_CHARS = DEFAULT_CONFIG.transcriptMaxTotalChars;
 /** Prefixed exactly once when anything was dropped. */
 export const TRANSCRIPT_TRUNCATION_MARKER = "[...earlier messages omitted...]";
 
@@ -625,10 +625,15 @@ export async function evaluate(
       candidates.push(candidate);
     }
   }
-  const attempts = candidates.slice(0, EVALUATOR_MAX_ATTEMPTS);
+  // The candidate ceiling and the transcript bounds come from configuration, so a
+  // user can bound cost/egress per evaluation (spec §9).
+  const attempts = candidates.slice(0, cfg.evaluatorMaxAttempts);
 
   const messages = await ctx.session.context({ sessionID: goalSessionID });
-  const transcript = renderTranscript(messages);
+  const transcript = renderTranscript(messages, {
+    maxMessageChars: cfg.transcriptMaxMessageChars,
+    maxTotalChars: cfg.transcriptMaxTotalChars,
+  });
   const prompt = buildEvaluatorPrompt(record.condition, transcript);
 
   let lastError: unknown;
@@ -665,8 +670,12 @@ export async function evaluate(
   );
 }
 
-/** How many model candidates one evaluation may try before giving up (E8). */
-export const EVALUATOR_MAX_ATTEMPTS = 5;
+/**
+ * Default candidate ceiling for one evaluation before giving up (E8). The
+ * effective value is `ResolvedConfig.evaluatorMaxAttempts`; this constant is the
+ * default, kept exported for tests and single-source use via `DEFAULT_CONFIG`.
+ */
+export const EVALUATOR_MAX_ATTEMPTS = DEFAULT_CONFIG.evaluatorMaxAttempts;
 
 function sameModel(a: EvaluatorModelRef, b: EvaluatorModelRef): boolean {
   return a.providerID === b.providerID && a.modelID === b.modelID;

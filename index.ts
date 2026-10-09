@@ -114,6 +114,8 @@ interface GoalCommandContext {
 type GoalSetupContext = LoopContext &
   WatchContext & {
     readonly command: GoalCommandContext;
+    /** `ctx.options` — the documented V2 option channel (spec §9). */
+    readonly options?: Readonly<Record<string, unknown>>;
     /**
      * Present on the shipped server context. Optional here so registration can
      * degrade gracefully rather than fail the whole plugin: the round-2 spike
@@ -238,6 +240,9 @@ export default {
     }
 
     const rootDir = String(ctx.location.directory);
+    // `ctx.options` — the documented V2 option channel, read as the lowest
+    // explicit configuration layer (spec §9).
+    const pluginOptions: unknown = ctx.options;
 
     let rpcRegistration: RpcRegistration<typeof portableGoalRpc> | undefined;
 
@@ -259,7 +264,7 @@ export default {
       },
     };
 
-    const deps: GoalLoopDeps = { ctx, rootDir, notify };
+    const deps: GoalLoopDeps = { ctx, rootDir, pluginOptions, notify };
 
     // --- RPC registration (spec §6.2). Degrades gracefully if unavailable. ---
     try {
@@ -296,7 +301,7 @@ export default {
           };
         },
         config: async () => {
-          const { config } = resolveConfig(rootDir);
+          const { config } = resolveConfig(rootDir, pluginOptions);
           let resolvedEvaluatorModel: string | undefined;
           let evaluatorProvider: string | undefined;
           try {
@@ -315,6 +320,9 @@ export default {
             ...(resolvedEvaluatorModel !== undefined ? { resolvedEvaluatorModel } : {}),
             ...(evaluatorProvider !== undefined ? { evaluatorProvider } : {}),
             permissiveModePolicy: config.permissiveModePolicy,
+            transcriptMaxMessageChars: config.transcriptMaxMessageChars,
+            transcriptMaxTotalChars: config.transcriptMaxTotalChars,
+            evaluatorMaxAttempts: config.evaluatorMaxAttempts,
           };
         },
       });

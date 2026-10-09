@@ -9,7 +9,14 @@ import {
   ANTI_SPIN_MAX,
   ANTI_SPIN_MIN,
   DEFAULT_CONFIG,
+  EVALUATOR_ATTEMPTS_MAX,
+  EVALUATOR_ATTEMPTS_MIN,
   loadConfig,
+  resolveConfigFrom,
+  TRANSCRIPT_MESSAGE_MAX,
+  TRANSCRIPT_MESSAGE_MIN,
+  TRANSCRIPT_TOTAL_MAX,
+  TRANSCRIPT_TOTAL_MIN,
   TURN_CAP_MAX,
   TURN_CAP_MIN,
 } from "../config";
@@ -19,6 +26,9 @@ const DOCUMENTED_DEFAULT = {
   turnCap: 50,
   evaluatorModel: undefined,
   permissiveModePolicy: "warn",
+  transcriptMaxMessageChars: 8000,
+  transcriptMaxTotalChars: 48000,
+  evaluatorMaxAttempts: 5,
 } as const;
 
 describe("defaults (AC-38, spec §9)", () => {
@@ -120,12 +130,18 @@ describe("valid values are accepted silently (AC-38)", () => {
       turnCap: 500,
       evaluatorModel: "x/y",
       permissiveModePolicy: "refuse",
+      transcriptMaxMessageChars: 1000,
+      transcriptMaxTotalChars: 9000,
+      evaluatorMaxAttempts: 2,
     });
     expect(config).toEqual({
       antiSpinThreshold: 25,
       turnCap: 500,
       evaluatorModel: "x/y",
       permissiveModePolicy: "refuse",
+      transcriptMaxMessageChars: 1000,
+      transcriptMaxTotalChars: 9000,
+      evaluatorMaxAttempts: 2,
     });
     expect(warnings).toEqual([]);
   });
@@ -222,5 +238,198 @@ describe("multiple invalid values each warn once, naming the value (AC-39)", () 
     // The empty evaluatorModel has no value token; the warning must at least
     // identify which setting was invalid.
     expect(joined).toContain("evaluatorModel");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cost / egress caps (added 2026-10-09): transcript bounds and candidate attempts
+// ---------------------------------------------------------------------------
+
+describe("cost and egress caps (defaults, bounds, validation)", () => {
+  test("documented defaults are the evaluator's own constants", () => {
+    expect(DEFAULT_CONFIG.transcriptMaxMessageChars).toBe(8000);
+    expect(DEFAULT_CONFIG.transcriptMaxTotalChars).toBe(48000);
+    expect(DEFAULT_CONFIG.evaluatorMaxAttempts).toBe(5);
+  });
+
+  test("bounds are sane and ordered", () => {
+    expect(TRANSCRIPT_MESSAGE_MIN).toBeLessThan(TRANSCRIPT_MESSAGE_MAX);
+    expect(TRANSCRIPT_TOTAL_MIN).toBeLessThan(TRANSCRIPT_TOTAL_MAX);
+    expect(EVALUATOR_ATTEMPTS_MIN).toBe(1);
+    expect(EVALUATOR_ATTEMPTS_MAX).toBeGreaterThan(EVALUATOR_ATTEMPTS_MIN);
+  });
+
+  test("in-range values are accepted silently", () => {
+    const { config, warnings } = loadConfig({
+      transcriptMaxMessageChars: TRANSCRIPT_MESSAGE_MIN,
+      transcriptMaxTotalChars: TRANSCRIPT_TOTAL_MAX,
+      evaluatorMaxAttempts: EVALUATOR_ATTEMPTS_MIN,
+    });
+    expect(config.transcriptMaxMessageChars).toBe(TRANSCRIPT_MESSAGE_MIN);
+    expect(config.transcriptMaxTotalChars).toBe(TRANSCRIPT_TOTAL_MAX);
+    expect(config.evaluatorMaxAttempts).toBe(EVALUATOR_ATTEMPTS_MIN);
+    expect(warnings).toEqual([]);
+  });
+
+  test("out of range → default + warning naming the value", () => {
+    const cases: Array<[keyof typeof DEFAULT_CONFIG, number, number]> = [
+      ["transcriptMaxMessageChars", 10, 8000],
+      ["transcriptMaxMessageChars", 10_000_000, 8000],
+      ["transcriptMaxTotalChars", 0, 48000],
+      ["transcriptMaxTotalChars", 10_000_000, 48000],
+      ["evaluatorMaxAttempts", 0, 5],
+      ["evaluatorMaxAttempts", 100, 5],
+    ];
+    for (const [key, bad, fallback] of cases) {
+      const { config, warnings } = loadConfig({ [key]: bad });
+      expect(config[key]).toBe(fallback);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(String(bad));
+    }
+  });
+
+  test("wrong types → default + warning", () => {
+    for (const bad of ["8000", 1.5, Number.NaN, true, {}, []]) {
+      const { config, warnings } = loadConfig({ evaluatorMaxAttempts: bad });
+      expect(config.evaluatorMaxAttempts).toBe(5);
+      expect(warnings).toHaveLength(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layered resolution: defaults < options < goal.json < environment (spec §9)
+// ---------------------------------------------------------------------------
+
+describe("resolveConfigFrom — precedence", () => {
+  test("no sources → defaults, no warnings", () => {
+    const { config, warnings } = resolveConfigFrom({});
+    expect(config).toEqual(DOCUMENTED_DEFAULT);
+    expect(warnings).toEqual([]);
+  });
+
+  test("plugin options alone are applied", () => {
+    const { config, warnings } = resolveConfigFrom({ options: { turnCap: 7 } });
+    expect(config.turnCap).toBe(7);
+    expect(warnings).toEqual([]);
+  });
+
+  test("the file overrides plugin options", () => {
+    const { config } = resolveConfigFrom({
+      options: { turnCap: 7 },
+      file: { turnCap: 9 },
+    });
+    expect(config.turnCap).toBe(9);
+  });
+
+  test("the environment overrides the file", () => {
+    const { config } = resolveConfigFrom({
+      options: { turnCap: 7 },
+      file: { turnCap: 9 },
+      env: { OPENCODE_GOAL_TURNCAP: "11" },
+    });
+    expect(config.turnCap).toBe(11);
+  });
+
+  test("every environment variable maps to its key", () => {
+    const { config, warnings } = resolveConfigFrom({
+      env: {
+        OPENCODE_GOAL_ANTISPIN: "5",
+        OPENCODE_GOAL_TURNCAP: "6",
+        OPENCODE_GOAL_EVAL_MODEL: "p/m",
+        OPENCODE_GOAL_PERMISSIVE: "refuse",
+        OPENCODE_GOAL_TRANSCRIPT_MESSAGE: "1000",
+        OPENCODE_GOAL_TRANSCRIPT_TOTAL: "2000",
+        OPENCODE_GOAL_EVAL_ATTEMPTS: "4",
+      },
+    });
+    expect(config.antiSpinThreshold).toBe(5);
+    expect(config.turnCap).toBe(6);
+    expect(config.evaluatorModel).toBe("p/m");
+    expect(config.permissiveModePolicy).toBe("refuse");
+    expect(config.transcriptMaxMessageChars).toBe(1000);
+    expect(config.transcriptMaxTotalChars).toBe(2000);
+    expect(config.evaluatorMaxAttempts).toBe(4);
+    expect(warnings).toEqual([]);
+  });
+});
+
+describe("resolveConfigFrom — the ignored-invalid-env-override defect (regression)", () => {
+  test("an invalid env value must NOT erase a valid file value", () => {
+    const { config, warnings } = resolveConfigFrom({
+      file: { turnCap: 9 },
+      env: { OPENCODE_GOAL_TURNCAP: "50x" },
+    });
+    // Before the fix this returned the built-in default 50: the raw env string was
+    // written into the merge map and failed validation later.
+    expect(config.turnCap).toBe(9);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("OPENCODE_GOAL_TURNCAP");
+    expect(warnings[0]).toContain("ignoring this environment override");
+  });
+
+  test("an invalid env value must NOT erase a valid plugin option", () => {
+    const { config } = resolveConfigFrom({
+      options: { turnCap: 8 },
+      env: { OPENCODE_GOAL_TURNCAP: "" },
+    });
+    expect(config.turnCap).toBe(8);
+  });
+
+  test("with no lower layer, an invalid env value falls back to the default", () => {
+    const { config, warnings } = resolveConfigFrom({ env: { OPENCODE_GOAL_TURNCAP: "nope" } });
+    expect(config.turnCap).toBe(50);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("an out-of-range env value is rejected like a malformed one", () => {
+    const { config, warnings } = resolveConfigFrom({
+      file: { antiSpinThreshold: 4 },
+      env: { OPENCODE_GOAL_ANTISPIN: "999" },
+    });
+    expect(config.antiSpinThreshold).toBe(4);
+    expect(warnings[0]).toContain("OPENCODE_GOAL_ANTISPIN");
+  });
+
+  test("an invalid env policy falls back to the file policy, not 'warn'", () => {
+    const { config } = resolveConfigFrom({
+      file: { permissiveModePolicy: "refuse" },
+      env: { OPENCODE_GOAL_PERMISSIVE: "banana" },
+    });
+    expect(config.permissiveModePolicy).toBe("refuse");
+  });
+});
+
+describe("resolveConfigFrom — malformed layers", () => {
+  test("non-object options and file are ignored (not crashed on)", () => {
+    const { config, warnings } = resolveConfigFrom({
+      options: "not-an-object",
+      file: [1, 2, 3],
+    });
+    expect(config).toEqual(DOCUMENTED_DEFAULT);
+    expect(warnings).toEqual([]);
+  });
+
+  test("null options and file are ignored", () => {
+    const { config, warnings } = resolveConfigFrom({ options: null, file: null });
+    expect(config).toEqual(DOCUMENTED_DEFAULT);
+    expect(warnings).toEqual([]);
+  });
+
+  test("an invalid value in the file still falls back to the default with a warning", () => {
+    const { config, warnings } = resolveConfigFrom({ file: { turnCap: null } });
+    expect(config.turnCap).toBe(50);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("turnCap");
+  });
+
+  test("unknown keys in any layer are ignored", () => {
+    const { config, warnings } = resolveConfigFrom({
+      options: { nope: 1 },
+      file: { alsoNope: true },
+      env: { OPENCODE_GOAL_UNKNOWN: "x" },
+    });
+    expect(config).toEqual(DOCUMENTED_DEFAULT);
+    expect(warnings).toEqual([]);
   });
 });

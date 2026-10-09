@@ -11,10 +11,12 @@
  * (progress.md, "INCIDENT" and "The architectural blocker — local plugins cannot
  * import"). Only relative imports into `core/` are used here.
  *
- * **RPC is out of v1.** `ctx.rpc.register` requires a portable definition built
- * with the effect `Schema` module, which is unreachable from this shape. The
- * loop, the `/goal` command and the event watchers remain; the TUI half drops
- * out with the RPC bridge.
+ * **RPC is restored (2026-10-09).** It was dropped during the zero-import rewrite
+ * under a ruling since RETRACTED: bare specifiers DO resolve from a discovered
+ * plugin directory, because the upward walk reaches `<repo>/node_modules`
+ * (progress.md, "RETRACTED"). Registration degrades gracefully — if `ctx.rpc` is
+ * absent or `register` throws, the loop and `/goal` still work and only the TUI
+ * bridge is missing.
  *
  * Setup registers the `/goal` command and the event watchers, then returns a
  * `Cleanup` that disposes the registrations, aborts every live loop, and removes
@@ -50,12 +52,18 @@ import {
   notePermissionAsk,
   noteToolUse,
   onSessionDeleted,
+  resolveConfig,
   startGoal,
   stopSessionForNewConversation,
   type GoalLoopDeps,
   type LoopContext,
+  type LoopNotifications,
 } from "./core/loop";
-import { removeEvaluatorSession } from "./core/evaluator";
+import {
+  formatEvaluatorModel,
+  removeEvaluatorSession,
+  resolveEvaluatorModel,
+} from "./core/evaluator";
 import {
   clearConfirmation,
   parseGoalArg,
@@ -64,6 +72,10 @@ import {
 } from "./core/parser";
 import { readGoal, scanGoals } from "./core/store";
 import { installWatchers, type WatchContext } from "./core/watch";
+
+import type { Plugin } from "@opencode/plugin";
+import type { RpcRegistration } from "@opencode/plugin/promise/rpc";
+import { portableGoalRpc } from "./rpc";
 
 // ---------------------------------------------------------------------------
 // Local structural typing (no bare imports)
@@ -99,7 +111,17 @@ interface GoalCommandContext {
  * `@opencode/plugin` types via **type-only** imports. Type-only imports are
  * erased at runtime, so they add no bare specifier to this module's load graph.
  */
-type GoalSetupContext = LoopContext & WatchContext & { readonly command: GoalCommandContext };
+type GoalSetupContext = LoopContext &
+  WatchContext & {
+    readonly command: GoalCommandContext;
+    /**
+     * Present on the shipped server context. Optional here so registration can
+     * degrade gracefully rather than fail the whole plugin: the round-2 spike
+     * observed the RPC surface blocked, and the loop and `/goal` must still work
+     * without the TUI bridge.
+     */
+    readonly rpc?: Plugin.Context["rpc"];
+  };
 
 /** A plugin cleanup, matching the shipped `Cleanup` shape. */
 type Cleanup = () => Promise<void> | void;
@@ -200,6 +222,7 @@ async function statusText(sessionID: string, deps: GoalLoopDeps): Promise<string
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Plugin definition
 // ---------------------------------------------------------------------------
 
@@ -215,7 +238,90 @@ export default {
     }
 
     const rootDir = String(ctx.location.directory);
-    const deps: GoalLoopDeps = { ctx, rootDir };
+
+    let rpcRegistration: RpcRegistration<typeof portableGoalRpc> | undefined;
+
+    // RPC emissions are best-effort: a failed emit must never affect the loop.
+    const notify: LoopNotifications = {
+      changed: (payload) => {
+        try {
+          void rpcRegistration?.events.emit("changed", payload)?.catch?.(() => {});
+        } catch {
+          // Best effort.
+        }
+      },
+      warning: (payload) => {
+        try {
+          void rpcRegistration?.events.emit("warning", payload)?.catch?.(() => {});
+        } catch {
+          // Best effort.
+        }
+      },
+    };
+
+    const deps: GoalLoopDeps = { ctx, rootDir, notify };
+
+    // --- RPC registration (spec §6.2). Degrades gracefully if unavailable. ---
+    try {
+      rpcRegistration = await ctx.rpc?.register(portableGoalRpc, {
+        status: async (input) => {
+          const { record } = await readGoal(input.sessionID, deps.ctx);
+          if (record === null) return { kind: "none" as const };
+          const now = Date.now();
+          const base = {
+            condition: record.condition,
+            turnsEvaluated: record.turnsEvaluated,
+            tokensSpent: record.tokensSpent,
+            lastReason: record.lastReason,
+            state: record.state,
+          };
+          if (record.state === "active") {
+            return { kind: "active" as const, ...base, elapsedMs: now - record.setAt };
+          }
+          return {
+            kind: record.state === "achieved" ? ("achieved" as const) : ("failed" as const),
+            ...base,
+            elapsedMs: (record.endedAt ?? now) - record.setAt,
+          };
+        },
+        clear: async (input) => {
+          const result = await clearGoal(input.sessionID, deps);
+          return {
+            cleared: result.cleared,
+            ...(result.condition !== undefined ? { condition: result.condition } : {}),
+            message:
+              result.cleared && result.condition !== undefined
+                ? clearConfirmation(result.condition)
+                : STATUS_NO_GOAL,
+          };
+        },
+        config: async () => {
+          const { config } = resolveConfig(rootDir);
+          let resolvedEvaluatorModel: string | undefined;
+          let evaluatorProvider: string | undefined;
+          try {
+            const resolved = await resolveEvaluatorModel(undefined, config, ctx);
+            if (resolved.model !== undefined) {
+              resolvedEvaluatorModel = formatEvaluatorModel(resolved.model);
+              evaluatorProvider = resolved.model.providerID;
+            }
+          } catch {
+            // Read-only surface; resolution failure leaves the fields absent.
+          }
+          return {
+            antiSpinThreshold: config.antiSpinThreshold,
+            turnCap: config.turnCap,
+            ...(config.evaluatorModel !== undefined ? { evaluatorModel: config.evaluatorModel } : {}),
+            ...(resolvedEvaluatorModel !== undefined ? { resolvedEvaluatorModel } : {}),
+            ...(evaluatorProvider !== undefined ? { evaluatorProvider } : {}),
+            permissiveModePolicy: config.permissiveModePolicy,
+          };
+        },
+      });
+    } catch {
+      // RPC unavailable: the loop and command still work; the TUI bridge is absent.
+      rpcRegistration = undefined;
+    }
 
     // Emit the exact command-output strings as synthetic transcript entries. These
     // must not start a turn (AC-8), hence `resume:false`.
@@ -300,6 +406,12 @@ export default {
       } catch {
         // Disposal is best-effort.
       }
+      try {
+        await rpcRegistration?.dispose();
+      } catch {
+        // Disposal is best-effort.
+      }
+      rpcRegistration = undefined;
       // Remove scratch evaluator sessions for any surviving (dormant) record.
       try {
         const { goals } = await scanGoals(ctx);

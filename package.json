@@ -2,12 +2,21 @@
   "name": "opencode-goal",
   "private": true,
   "type": "module",
-  "description": "OpenCode V2 /goal plugin — an autonomous goal-directed loop. Zero runtime imports by design; see plugin-src/README.",
+  "description": "OpenCode V2 /goal plugin — an autonomous goal-directed loop (server + TUI halves).",
   "exports": {
-    ".": "./index.ts"
+    ".": "./index.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
   },
   "server": "./index.ts",
-  "devDependencies": {
+  "tui": "./tui.tsx",
+  "rpc": "./rpc.ts",
+  "dependencies": {
     "@opencode/plugin": "2.0.22"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
   }
 }

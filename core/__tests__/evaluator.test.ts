@@ -584,7 +584,10 @@ interface FakeEvalCtx {
   generates: { sessionID: string; prompt: string }[];
 }
 
-function evalCtx(models: SelectableModel[] = []): FakeEvalCtx {
+function evalCtx(
+  models: SelectableModel[] = [],
+  onGenerate?: (input: { sessionID: string; prompt: string }, callIndex: number) => { text: string },
+): FakeEvalCtx {
   const creates: Record<string, unknown>[] = [];
   const generates: { sessionID: string; prompt: string }[] = [];
   const alive = new Set<string>(["goal-1"]);
@@ -612,6 +615,7 @@ function evalCtx(models: SelectableModel[] = []): FakeEvalCtx {
       context: async () => [{ type: "user", text: "hello" }],
       generate: async (input: { sessionID: string; prompt: string }) => {
         generates.push(input);
+        if (onGenerate !== undefined) return onGenerate(input, generates.length - 1);
         return { text: "MET: done" };
       },
     },
@@ -693,5 +697,116 @@ describe("evaluate (spec §7, AC-20/AC-21/AC-28)", () => {
     // prompt carries the condition verbatim and the transcript
     expect(generates[0].prompt).toContain("the token BANANA is written");
     expect(generates[0].prompt).toContain("User: hello");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §7 + E8 — fall back to the next candidate when a model is unusable
+// ---------------------------------------------------------------------------
+
+describe("evaluate — fall back to the next candidate on an unusable model", () => {
+  beforeEach(() => clearEvaluatorSessionCache());
+
+  const cfg: ResolvedConfig = {
+    antiSpinThreshold: 3,
+    turnCap: 50,
+    evaluatorModel: undefined,
+    permissiveModePolicy: "warn",
+  };
+
+  const twoCandidates = (): SelectableModel[] => [
+    model({ providerID: "a", modelID: "first", cost: [{ output: 0 }] }),
+    model({ providerID: "b", modelID: "second", cost: [{ output: 5 }] }),
+  ];
+
+  it("happy path is unchanged: the first candidate succeeds with one generate call", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates());
+    const verdict = await evaluate("goal-1", createGoal("the token is present"), cfg, ctx);
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(1);
+  });
+
+  it("retries the next candidate when the first is reported deprecated, and warns", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates(), (_input, i) => {
+      if (i === 0) throw new Error("Model first has been deprecated.");
+      return { text: "MET: done" };
+    });
+    const warnings: string[] = [];
+    const verdict = await evaluate("goal-1", createGoal("c"), cfg, ctx, (m) => warnings.push(m));
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(2);
+    // the retry ran on a fresh scratch session for the second candidate
+    expect(generates[0].sessionID).not.toBe(generates[1].sessionID);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("a/first is unusable");
+    expect(warnings[0]).toContain("retrying with b/second");
+  });
+
+  it("does not fall back on an unrelated error: it propagates with no second call", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates(), () => {
+      throw new Error("network unreachable");
+    });
+    await expect(evaluate("goal-1", createGoal("c"), cfg, ctx)).rejects.toThrow(
+      "network unreachable",
+    );
+    expect(generates.length).toBe(1);
+  });
+
+  it("throws the last failure when every candidate is unusable", async () => {
+    const models = [
+      model({ providerID: "a", modelID: "one", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "two", cost: [{ output: 1 }] }),
+      model({ providerID: "c", modelID: "three", cost: [{ output: 2 }] }),
+    ];
+    const { ctx, generates } = evalCtx(models, (_input, i) => {
+      throw new Error(`Model ${["one", "two", "three"][i]} has been deprecated.`);
+    });
+    await expect(evaluate("goal-1", createGoal("c"), cfg, ctx)).rejects.toThrow(
+      "last failure: Model three has been deprecated.",
+    );
+    expect(generates.length).toBe(3);
+  });
+
+  it("caps attempts at five even when more candidates are listed", async () => {
+    const models = Array.from({ length: 7 }, (_, i) =>
+      model({ providerID: "p", modelID: `m${i}`, cost: [{ output: i }] }),
+    );
+    const { ctx, generates } = evalCtx(models, () => {
+      throw new Error("Model m0 has been retired.");
+    });
+    await expect(evaluate("goal-1", createGoal("c"), cfg, ctx)).rejects.toThrow("retired");
+    expect(generates.length).toBe(5);
+  });
+
+  it("handles a non-Error throw (a thrown string) without crashing", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates(), (_input, i) => {
+      if (i === 0) throw "Model first has been deprecated.";
+      return { text: "MET: done" };
+    });
+    const warnings: string[] = [];
+    const verdict = await evaluate("goal-1", createGoal("c"), cfg, ctx, (m) => warnings.push(m));
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(2);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("has been deprecated.");
+  });
+
+  it("tries an explicitly configured model first, then falls back with a warning", async () => {
+    const models = [
+      model({ providerID: "ep", modelID: "pinned", cost: [{ output: 99 }] }),
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 0 }] }),
+    ];
+    const pinned: ResolvedConfig = { ...cfg, evaluatorModel: "ep/pinned" };
+    const { ctx, generates } = evalCtx(models, (_input, i) => {
+      if (i === 0) throw new Error("Model pinned has been deprecated.");
+      return { text: "MET: done" };
+    });
+    const warnings: string[] = [];
+    const verdict = await evaluate("goal-1", createGoal("c"), pinned, ctx, (m) => warnings.push(m));
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(2);
+    expect(
+      warnings.some((w) => w.includes("ep/pinned is unusable") && w.includes("a/cheap")),
+    ).toBe(true);
   });
 });

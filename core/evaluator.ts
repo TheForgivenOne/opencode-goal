@@ -294,11 +294,17 @@ function isTextCapable(model: SelectableModel): boolean {
  * The AC-27 / AC-28 selection rule: enabled, not deprecated, text-capable,
  * excluding the working session's model, sorted by `cost[0].output` ascending,
  * tie-break by larger `limit.context`, then a deterministic id tie-break.
+ *
+ * Returns the full, ordered candidate list; {@link selectEvaluatorModel} is the
+ * head of it. Exposed because the live model list can carry a stale `status`
+ * for a retired model (it reports the model as enabled/active while the
+ * generation path rejects it), so `evaluate` must be able to walk on to the
+ * next candidate when the chosen one turns out to be unusable.
  */
-export function selectEvaluatorModel(
+export function selectEvaluatorCandidates(
   models: readonly SelectableModel[],
   workingModel?: WorkingModelRef | null,
-): EvaluatorModelRef | undefined {
+): EvaluatorModelRef[] {
   const candidates = models.filter(
     (model) =>
       model.enabled === true &&
@@ -311,7 +317,6 @@ export function selectEvaluatorModel(
         modelIdOf(model) === workingModel.modelID
       ),
   );
-  if (candidates.length === 0) return undefined;
 
   const sorted = [...candidates].sort((a, b) => {
     const byCost = outputCost(a) - outputCost(b);
@@ -321,8 +326,15 @@ export function selectEvaluatorModel(
     return modelIdOf(a).localeCompare(modelIdOf(b));
   });
 
-  const chosen = sorted[0];
-  return { providerID: chosen.providerID, modelID: modelIdOf(chosen) };
+  return sorted.map((model) => ({ providerID: model.providerID, modelID: modelIdOf(model) }));
+}
+
+/** The single best evaluator model: the head of {@link selectEvaluatorCandidates}. */
+export function selectEvaluatorModel(
+  models: readonly SelectableModel[],
+  workingModel?: WorkingModelRef | null,
+): EvaluatorModelRef | undefined {
+  return selectEvaluatorCandidates(models, workingModel)[0];
 }
 
 function outputCost(model: SelectableModel): number {
@@ -364,7 +376,19 @@ export async function resolveEvaluatorModel(
   ctx: EvaluatorContext,
 ): Promise<ResolvedEvaluatorModel> {
   const models = await listSelectableModels(ctx);
+  return resolveEvaluatorModelFrom(models, workingModel, cfg);
+}
 
+/**
+ * Pure core of {@link resolveEvaluatorModel}: apply the §7.2 rules to an
+ * already-fetched model list. Split out so `evaluate` can list models once and
+ * reuse them to build the full fallback candidate list.
+ */
+export function resolveEvaluatorModelFrom(
+  models: readonly SelectableModel[],
+  workingModel: WorkingModelRef | undefined,
+  cfg: ResolvedConfig,
+): ResolvedEvaluatorModel {
   const configured = cfg.evaluatorModel?.trim();
   if (configured !== undefined && configured !== "") {
     const found = findModelById(models, configured);
@@ -549,7 +573,8 @@ export async function evaluate(
   onWarning?: (message: string) => void,
 ): Promise<Verdict> {
   const workingModel = await readWorkingModel(goalSessionID, ctx);
-  const resolved = await resolveEvaluatorModel(workingModel, cfg, ctx);
+  const models = await listSelectableModels(ctx);
+  const resolved = resolveEvaluatorModelFrom(models, workingModel, cfg);
 
   if (resolved.warning !== undefined && onWarning !== undefined) {
     onWarning(resolved.warning);
@@ -560,22 +585,80 @@ export async function evaluate(
     );
   }
 
-  const evaluatorSessionID = await ensureEvaluatorSession(
-    goalSessionID,
-    resolved.model,
-    ctx,
-  );
+  // Ordered fallback list: the resolved model first (the explicitly configured
+  // one, when set), then the remaining auto-selected candidates. The live model
+  // list can carry a stale `status` for a retired model, so the generation path
+  // is authoritative and may reject the first choice.
+  const candidates: EvaluatorModelRef[] = [resolved.model];
+  for (const candidate of selectEvaluatorCandidates(models, workingModel)) {
+    if (!candidates.some((chosen) => sameModel(chosen, candidate))) {
+      candidates.push(candidate);
+    }
+  }
+  const attempts = candidates.slice(0, EVALUATOR_MAX_ATTEMPTS);
 
   const messages = await ctx.session.context({ sessionID: goalSessionID });
   const transcript = renderTranscript(messages);
   const prompt = buildEvaluatorPrompt(record.condition, transcript);
-  const { text } = await ctx.session.generate({
-    sessionID: evaluatorSessionID,
-    prompt,
-  });
 
-  const parsed = parseVerdict(text);
-  return { kind: parsed.kind, reason: parsed.reason };
+  let lastError: unknown;
+  for (let i = 0; i < attempts.length; i++) {
+    const candidate = attempts[i];
+    try {
+      const evaluatorSessionID = await ensureEvaluatorSession(
+        goalSessionID,
+        candidate,
+        ctx,
+      );
+      const { text } = await ctx.session.generate({
+        sessionID: evaluatorSessionID,
+        prompt,
+      });
+      const parsed = parseVerdict(text);
+      return { kind: parsed.kind, reason: parsed.reason };
+    } catch (err) {
+      // Only a model-unusable failure justifies trying the next candidate; any
+      // other error (network, quota, malformed request) preserves E8 semantics.
+      if (!isModelUnusableError(err)) throw err;
+      lastError = err;
+      const next = attempts[i + 1];
+      if (next !== undefined && onWarning !== undefined) {
+        onWarning(
+          `Evaluator model ${formatEvaluatorModel(candidate)} is unusable (${describeError(err)}); retrying with ${formatEvaluatorModel(next)}.`,
+        );
+      }
+    }
+  }
+
+  throw new Error(
+    `All evaluator candidates are unusable; last failure: ${describeError(lastError)}`,
+  );
+}
+
+/** How many model candidates one evaluation may try before giving up (E8). */
+export const EVALUATOR_MAX_ATTEMPTS = 5;
+
+function sameModel(a: EvaluatorModelRef, b: EvaluatorModelRef): boolean {
+  return a.providerID === b.providerID && a.modelID === b.modelID;
+}
+
+/**
+ * Conservative classifier for "this model cannot be used" generation failures.
+ * The live model list can report a retired model as `status:"active"` while the
+ * generation path rejects it — observed as
+ * `Model exo-free has been deprecated.` Only this family is retryable;
+ * everything else (network, quota, malformed request) must propagate untouched.
+ */
+export function isModelUnusableError(err: unknown): boolean {
+  const message = describeError(err).toLowerCase();
+  return (
+    message.includes("deprecat") ||
+    message.includes("retir") ||
+    message.includes("not found") ||
+    message.includes("unknown") ||
+    message.includes("no such model") ||
+    message.includes("does not exist")
+  );
 }
 
 async function readWorkingModel(

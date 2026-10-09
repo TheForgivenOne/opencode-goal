@@ -33,6 +33,7 @@ import {
   type ConfigLoadResult,
   type RawConfig,
 } from "./config";
+import { sharedMap } from "./shared";
 import {
   crossProviderWarning,
   evaluate,
@@ -131,7 +132,15 @@ interface RunState {
   lastEvalMessageTime: number;
 }
 
-const runs = new Map<string, RunState>();
+/**
+ * Live loops, one per session **process-wide**.
+ *
+ * Not a module-level `const`: the entrypoint is loaded more than once per server
+ * process and each load re-evaluates the module, so module state would be
+ * per-instance and a human prompt would start a second loop for the same
+ * session. See `core/shared.ts`.
+ */
+const runs = sharedMap<string, RunState>("runs");
 
 // Serialize per-session storage mutations. A superseded loop may have a write
 // already in flight when `startGoal`/`clearGoal` mutates the same key; chaining

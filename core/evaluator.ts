@@ -27,6 +27,7 @@
 import type { Plugin } from "@opencode/plugin";
 import { DEFAULT_CONFIG, type ResolvedConfig } from "./config";
 import { type GoalRecord, type Verdict, type VerdictKind } from "./record";
+import { sharedMap } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Context slice
@@ -484,7 +485,9 @@ interface CachedEvaluatorSession {
 }
 
 /** One scratch session per goal session (spec §7.1). */
-const evaluatorSessions = new Map<string, CachedEvaluatorSession>();
+/** Process-wide, not module-level: see `core/shared.ts`. Two instances must not
+ * each hold a scratch session for the same goal. */
+const evaluatorSessions = sharedMap<string, CachedEvaluatorSession>("evaluatorSessions");
 
 /** Test hook: drop all cached evaluator sessions without touching the runtime. */
 export function clearEvaluatorSessionCache(): void {

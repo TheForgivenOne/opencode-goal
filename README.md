@@ -8,12 +8,17 @@ Ported from Claude Code's `/goal`.
 ## Install
 
 ```sh
-opencode plugin add opencode-goal
+opencode plugin add github:TheForgivenOne/opencode-goal
 ```
 
-Or place a local copy at `~/.config/opencode/plugins/opencode-goal/`. That
-directory is a global discovery directory, so **no config entry is needed**;
-`opencode plugin list` should show it.
+Or clone this repo and place the directory at
+`~/.config/opencode/plugins/opencode-goal/`. That directory is a global
+discovery directory, so **no config entry is needed**; `opencode plugin list`
+should show it.
+
+> **Not on npm.** The name `opencode-goal` on npm belongs to an unrelated
+> V1-era plugin, so `opencode plugin add opencode-goal` would install *that*
+> one rather than this. Install from GitHub as shown above.
 
 ## Usage
 

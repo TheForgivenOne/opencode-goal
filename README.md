@@ -74,9 +74,11 @@ Environment overrides: `OPENCODE_GOAL_ANTISPIN`, `OPENCODE_GOAL_TURNCAP`,
 `OPENCODE_GOAL_TRANSCRIPT_MESSAGE`, `OPENCODE_GOAL_TRANSCRIPT_TOTAL`,
 `OPENCODE_GOAL_EVAL_ATTEMPTS`.
 
-An invalid value is reported and ignored, and **any lower layer stays in
-effect** — a mistyped environment variable does not discard a valid
-`.opencode/goal.json` value.
+An invalid value is reported and ignored, and **the next lower layer stays in
+effect** — in every layer, not just the environment. A mistyped
+`OPENCODE_GOAL_TURNCAP` does not discard a valid `.opencode/goal.json` or
+`ctx.options` value; the built-in default applies only when no layer supplies a
+valid value.
 
 ### Kill switch
 

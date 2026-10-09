@@ -96,6 +96,17 @@ describe("goalRpc schemas validate at runtime (spec §6.2)", () => {
     // The cost/egress caps are part of the contract and typed too.
     expect(() => d({ ...valid, evaluatorMaxAttempts: "5" })).toThrow();
     expect(() => d({ ...valid, transcriptMaxTotalChars: null })).toThrow();
+    // ...and they are REQUIRED, not optional: making one optional in the schema
+    // must not silently pass (independent-review finding T2).
+    for (const key of [
+      "transcriptMaxMessageChars",
+      "transcriptMaxTotalChars",
+      "evaluatorMaxAttempts",
+    ] as const) {
+      const partial: Record<string, unknown> = { ...valid };
+      delete partial[key];
+      expect(() => d(partial)).toThrow();
+    }
   });
 
   it("changed event schema accepts a valid payload and rejects a missing sessionID", () => {

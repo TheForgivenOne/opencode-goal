@@ -433,3 +433,137 @@ describe("resolveConfigFrom — malformed layers", () => {
     expect(warnings).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bounds pinned BY VALUE — the tests above use the constants as both input and
+// expected, so they cannot detect a wrong bound. These can (review finding T1).
+// ---------------------------------------------------------------------------
+
+describe("documented bounds are pinned by value, not self-referentially (regression)", () => {
+  test("the transcript and attempt bounds cannot drift unnoticed", () => {
+    expect(TRANSCRIPT_MESSAGE_MIN).toBe(200);
+    expect(TRANSCRIPT_MESSAGE_MAX).toBe(200_000);
+    expect(TRANSCRIPT_TOTAL_MIN).toBe(200);
+    expect(TRANSCRIPT_TOTAL_MAX).toBe(2_000_000);
+    expect(EVALUATOR_ATTEMPTS_MIN).toBe(1);
+    expect(EVALUATOR_ATTEMPTS_MAX).toBe(25);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An invalid value in a HIGHER layer must not erase a valid LOWER layer.
+// The env layer was fixed first; the options/file layers had the same defect
+// (independent-review finding 1) and are fixed here.
+// ---------------------------------------------------------------------------
+
+describe("resolveConfigFrom — a higher invalid layer must not erase a lower valid one (regression)", () => {
+  test("an invalid file value leaves a valid ctx.options value in effect", () => {
+    const { config, warnings } = resolveConfigFrom({
+      options: { turnCap: 7 },
+      file: { turnCap: null },
+    });
+    expect(config.turnCap).toBe(7);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("turnCap");
+    expect(warnings[0]).toContain("the goal config file");
+  });
+
+  test("an out-of-range file value likewise leaves the option in effect", () => {
+    const { config, warnings } = resolveConfigFrom({
+      options: { turnCap: 7 },
+      file: { turnCap: 9999 },
+    });
+    expect(config.turnCap).toBe(7);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("an invalid option falls through to the built-in default (nothing below it)", () => {
+    const { config, warnings } = resolveConfigFrom({ options: { turnCap: "x" } });
+    expect(config.turnCap).toBe(50);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("the plugin options");
+  });
+
+  test("an invalid file value warns and names its layer", () => {
+    const { config, warnings } = resolveConfigFrom({ file: { antiSpinThreshold: -1 } });
+    expect(config.antiSpinThreshold).toBe(3);
+    expect(warnings[0]).toContain("the goal config file");
+  });
+
+  test("a valid env value still wins over both lower layers", () => {
+    const { config } = resolveConfigFrom({
+      options: { turnCap: 7 },
+      file: { turnCap: 8 },
+      env: { OPENCODE_GOAL_TURNCAP: "9" },
+    });
+    expect(config.turnCap).toBe(9);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A `__proto__` key in a parsed JSON file must not inject configuration
+// (independent-review finding 3).
+// ---------------------------------------------------------------------------
+
+describe("resolveConfigFrom — prototype safety (regression)", () => {
+  test("a __proto__ payload in the parsed file is ignored", () => {
+    const parsed: unknown = JSON.parse('{"__proto__":{"turnCap":123}}');
+    const { config, warnings } = resolveConfigFrom({ file: parsed });
+    expect(config.turnCap).toBe(50);
+    expect(warnings).toEqual([]);
+  });
+
+  test("the accumulator is not given a polluted prototype", () => {
+    const parsed: unknown = JSON.parse('{"__proto__":{"turnCap":123}}');
+    const { config } = resolveConfigFrom({ file: parsed, options: { turnCap: 6 } });
+    expect(config.turnCap).toBe(6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-field: a per-message cap above the total budget would leave the
+// evaluator judging from nothing (independent-review finding 2).
+// ---------------------------------------------------------------------------
+
+describe("transcript caps — the total must not be smaller than the per-message cap", () => {
+  test("a total below the per-message cap is clamped with a warning", () => {
+    const { config, warnings } = loadConfig({
+      transcriptMaxMessageChars: 200_000,
+      transcriptMaxTotalChars: 200,
+    });
+    expect(config.transcriptMaxMessageChars).toBe(200);
+    expect(config.transcriptMaxTotalChars).toBe(200);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("transcriptMaxTotalChars");
+  });
+
+  test("equal values are accepted silently", () => {
+    const { config, warnings } = loadConfig({
+      transcriptMaxMessageChars: 1000,
+      transcriptMaxTotalChars: 1000,
+    });
+    expect(config.transcriptMaxMessageChars).toBe(1000);
+    expect(warnings).toEqual([]);
+  });
+
+  test("the default pair is not clamped", () => {
+    const { config, warnings } = loadConfig({});
+    expect(warnings).toEqual([]);
+    expect(config.transcriptMaxMessageChars).toBeLessThanOrEqual(config.transcriptMaxTotalChars);
+  });
+});
+
+describe("null on each of the three new keys is present-and-invalid (review finding T3)", () => {
+  test("each defaults with one warning naming the value", () => {
+    const { config, warnings } = loadConfig({
+      transcriptMaxMessageChars: null,
+      transcriptMaxTotalChars: null,
+      evaluatorMaxAttempts: null,
+    });
+    expect(config.transcriptMaxMessageChars).toBe(8000);
+    expect(config.transcriptMaxTotalChars).toBe(48000);
+    expect(config.evaluatorMaxAttempts).toBe(5);
+    expect(warnings).toHaveLength(3);
+    for (const warning of warnings) expect(warning).toContain("null");
+  });
+});

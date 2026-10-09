@@ -174,7 +174,22 @@ export function loadConfig(raw: RawConfig | null | undefined): ConfigLoadResult 
     ),
   };
 
+  enforceTranscriptCaps(config, warnings);
+
   return { config, warnings };
+}
+
+/**
+ * A per-message cap larger than the total budget would truncate every message
+ * out entirely, leaving the evaluator with nothing to judge — two individually
+ * valid values that together disable evaluation. Clamp to the budget and say so.
+ */
+function enforceTranscriptCaps(config: ResolvedConfig, warnings: string[]): void {
+  if (config.transcriptMaxMessageChars <= config.transcriptMaxTotalChars) return;
+  warnings.push(
+    `transcriptMaxMessageChars (${config.transcriptMaxMessageChars}) is larger than transcriptMaxTotalChars (${config.transcriptMaxTotalChars}); using the total budget as the per-message cap.`,
+  );
+  config.transcriptMaxMessageChars = config.transcriptMaxTotalChars;
 }
 
 /** Render an offending value for a warning so the message names it (AC-39). */
@@ -195,58 +210,80 @@ function describe(value: unknown): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Every environment variable the plugin reads for configuration, with the
- * validation applied **before** the override is accepted. This is what stops an
- * invalid environment value from erasing a valid `.opencode/goal.json` value.
+ * How each configuration key is accepted. One spec per key, shared by every
+ * layer, so a value is validated **before** it is applied — in any layer. That
+ * is what stops an invalid value from erasing a valid one from a lower layer,
+ * and it also means only known keys are ever read.
  */
-const ENV_SPECS: readonly {
-  readonly name: string;
+const KEY_SPECS: readonly {
   readonly key: keyof RawConfig;
-  readonly parse: (text: string) => { ok: true; value: unknown } | { ok: false; expectation: string };
+  readonly accept: (
+    value: unknown,
+  ) => { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly expectation: string };
 }[] = [
-  { name: "OPENCODE_GOAL_ANTISPIN", key: "antiSpinThreshold", parse: envInteger(ANTI_SPIN_MIN, ANTI_SPIN_MAX) },
-  { name: "OPENCODE_GOAL_TURNCAP", key: "turnCap", parse: envInteger(TURN_CAP_MIN, TURN_CAP_MAX) },
-  { name: "OPENCODE_GOAL_EVAL_MODEL", key: "evaluatorModel", parse: envNonEmptyString },
-  { name: "OPENCODE_GOAL_PERMISSIVE", key: "permissiveModePolicy", parse: envPermissivePolicy },
+  { key: "antiSpinThreshold", accept: acceptInteger(ANTI_SPIN_MIN, ANTI_SPIN_MAX) },
+  { key: "turnCap", accept: acceptInteger(TURN_CAP_MIN, TURN_CAP_MAX) },
+  { key: "evaluatorModel", accept: acceptModelId },
+  { key: "permissiveModePolicy", accept: acceptPolicy },
   {
-    name: "OPENCODE_GOAL_TRANSCRIPT_MESSAGE",
     key: "transcriptMaxMessageChars",
-    parse: envInteger(TRANSCRIPT_MESSAGE_MIN, TRANSCRIPT_MESSAGE_MAX),
+    accept: acceptInteger(TRANSCRIPT_MESSAGE_MIN, TRANSCRIPT_MESSAGE_MAX),
   },
   {
-    name: "OPENCODE_GOAL_TRANSCRIPT_TOTAL",
     key: "transcriptMaxTotalChars",
-    parse: envInteger(TRANSCRIPT_TOTAL_MIN, TRANSCRIPT_TOTAL_MAX),
+    accept: acceptInteger(TRANSCRIPT_TOTAL_MIN, TRANSCRIPT_TOTAL_MAX),
   },
   {
-    name: "OPENCODE_GOAL_EVAL_ATTEMPTS",
     key: "evaluatorMaxAttempts",
-    parse: envInteger(EVALUATOR_ATTEMPTS_MIN, EVALUATOR_ATTEMPTS_MAX),
+    accept: acceptInteger(EVALUATOR_ATTEMPTS_MIN, EVALUATOR_ATTEMPTS_MAX),
   },
 ];
+
+function acceptInteger(min: number, max: number) {
+  return (value: unknown) =>
+    typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+      ? ({ ok: true, value } as const)
+      : ({ ok: false, expectation: `an integer in [${min}, ${max}]` } as const);
+}
+
+function acceptModelId(value: unknown) {
+  return typeof value === "string" && value.trim() !== ""
+    ? ({ ok: true, value } as const)
+    : ({ ok: false, expectation: "a non-empty model id" } as const);
+}
+
+function acceptPolicy(value: unknown) {
+  return value === "warn" || value === "refuse"
+    ? ({ ok: true, value } as const)
+    : ({ ok: false, expectation: `"warn" or "refuse"` } as const);
+}
+
+function specFor(key: keyof RawConfig) {
+  const spec = KEY_SPECS.find((candidate) => candidate.key === key);
+  if (spec === undefined) throw new Error(`no config spec for ${String(key)}`);
+  return spec;
+}
+
+/** Environment variable names, one per key (spec §9). */
+const ENV_NAMES: Readonly<Record<string, keyof RawConfig>> = {
+  OPENCODE_GOAL_ANTISPIN: "antiSpinThreshold",
+  OPENCODE_GOAL_TURNCAP: "turnCap",
+  OPENCODE_GOAL_EVAL_MODEL: "evaluatorModel",
+  OPENCODE_GOAL_PERMISSIVE: "permissiveModePolicy",
+  OPENCODE_GOAL_TRANSCRIPT_MESSAGE: "transcriptMaxMessageChars",
+  OPENCODE_GOAL_TRANSCRIPT_TOTAL: "transcriptMaxTotalChars",
+  OPENCODE_GOAL_EVAL_ATTEMPTS: "evaluatorMaxAttempts",
+};
 
 /** The environment variable that stops the loop outright (spec §8.5); not a config key. */
 export const DISABLE_ENV = "OPENCODE_GOAL_DISABLE";
 
-function envInteger(min: number, max: number) {
-  return (text: string): { ok: true; value: number } | { ok: false; expectation: string } => {
-    const trimmed = text.trim();
-    const parsed = trimmed === "" ? Number.NaN : Number(trimmed);
-    if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < min || parsed > max) {
-      return { ok: false, expectation: `an integer in [${min}, ${max}]` };
-    }
-    return { ok: true, value: parsed };
-  };
-}
-
-function envNonEmptyString(text: string): { ok: true; value: string } | { ok: false; expectation: string } {
-  if (text.trim() === "") return { ok: false, expectation: "a non-empty model id" };
-  return { ok: true, value: text };
-}
-
-function envPermissivePolicy(text: string): { ok: true; value: string } | { ok: false; expectation: string } {
-  if (text !== "warn" && text !== "refuse") return { ok: false, expectation: '"warn" or "refuse"' };
-  return { ok: true, value: text };
+/** Environment values arrive as strings: coerce the numeric keys, leave text keys alone. */
+function coerceEnv(key: keyof RawConfig, text: string): unknown {
+  if (key === "evaluatorModel" || key === "permissiveModePolicy") return text;
+  const trimmed = text.trim();
+  // An empty numeric value must not coerce to 0; keep the string so it is rejected.
+  return trimmed === "" ? text : Number(trimmed);
 }
 
 export interface ConfigSources {
@@ -262,32 +299,53 @@ export interface ConfigSources {
  * Merge and validate every configuration source. Precedence, lowest → highest:
  * defaults → plugin `options` → project `goal.json` → environment.
  *
- * An invalid **environment** value is rejected *before* it is applied and is
- * reported as an ignored override, so it cannot erase a valid file or option
- * value (this was the defect: the old env layer wrote the raw string into the
- * merge map, and validation then fell through to the *built-in default*).
- * Invalid `options`/`file` values still fall back to the default, because those
- * layers are copied verbatim and validated at the end.
+ * **Every layer is validated before it is applied**, so an invalid value in any
+ * layer is reported and skipped and the next-lower layer stays in effect; the
+ * built-in default applies only when no layer supplies a valid value.
+ *
+ * Until 2026-10-09 the layers were copied verbatim into one map and validated at
+ * the end, so an invalid value in a *higher* layer erased a valid lower one and
+ * fell through to the built-in default — silently. The environment layer was
+ * fixed first; this rewrite applies the same discipline to all of them.
+ *
+ * Only known keys are read, so a `__proto__` key in a parsed JSON config file
+ * cannot retarget the accumulator's prototype the way `Object.assign` would.
  */
 export function resolveConfigFrom(sources: ConfigSources): ConfigLoadResult {
   const warnings: string[] = [];
   const raw: RawConfig = {};
 
-  if (isPlainObject(sources.options)) Object.assign(raw, sources.options);
-  if (isPlainObject(sources.file)) Object.assign(raw, sources.file);
-
-  if (sources.env !== undefined) {
-    for (const spec of ENV_SPECS) {
-      const text = sources.env[spec.name];
-      if (text === undefined) continue;
-      const parsed = spec.parse(text);
-      if (!parsed.ok) {
+  const applyLayer = (layer: unknown, label: string): void => {
+    if (!isPlainObject(layer)) return;
+    for (const spec of KEY_SPECS) {
+      if (!Object.prototype.hasOwnProperty.call(layer, spec.key)) continue;
+      const value = layer[spec.key];
+      const accepted = spec.accept(value);
+      if (!accepted.ok) {
         warnings.push(
-          `Invalid ${spec.name} (${describe(text)}); expected ${parsed.expectation}; ignoring this environment override.`,
+          `Invalid ${spec.key} (${describe(value)}) in ${label}; expected ${accepted.expectation}; ignoring it.`,
         );
         continue;
       }
-      raw[spec.key] = parsed.value;
+      raw[spec.key] = accepted.value;
+    }
+  };
+
+  applyLayer(sources.options, "the plugin options");
+  applyLayer(sources.file, "the goal config file");
+
+  if (sources.env !== undefined) {
+    for (const [name, key] of Object.entries(ENV_NAMES)) {
+      const text = sources.env[name];
+      if (text === undefined) continue;
+      const accepted = specFor(key).accept(coerceEnv(key, text));
+      if (!accepted.ok) {
+        warnings.push(
+          `Invalid ${name} (${describe(text)}); expected ${accepted.expectation}; ignoring this environment override.`,
+        );
+        continue;
+      }
+      raw[key] = accepted.value;
     }
   }
 

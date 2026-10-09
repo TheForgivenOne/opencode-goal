@@ -170,12 +170,16 @@ function text(prefix: string, value: string | undefined): string {
  * the `…` marker is counted inside the cap. The same discipline as the
  * condition limit in `parser.ts` (`[...s].length`): code points, not UTF-16
  * code units.
+ *
+ * `max` is clamped to at least 1: a cap of 0 or less cannot contain even the
+ * marker, and callers reach this with validated config where the minimum is 200.
  */
 function capChars(value: string, max: number): string {
+  const limit = Number.isFinite(max) && max >= 1 ? Math.floor(max) : 1;
   const chars = [...value];
-  if (chars.length <= max) return value;
+  if (chars.length <= limit) return value;
   const marker = "…";
-  const keep = Math.max(0, max - [...marker].length);
+  const keep = Math.max(0, limit - [...marker].length);
   return chars.slice(0, keep).join("") + marker;
 }
 
@@ -496,6 +500,7 @@ export async function ensureEvaluatorSession(
   goalSessionID: string,
   model: EvaluatorModelRef,
   ctx: EvaluatorContext,
+  onWarning?: (message: string) => void,
 ): Promise<string> {
   const modelKey = formatEvaluatorModel(model);
   const cached = evaluatorSessions.get(goalSessionID);
@@ -514,7 +519,11 @@ export async function ensureEvaluatorSession(
     // rather than orphaning it: otherwise every fallback leaks a
     // `goal-evaluator:*` session that cleanup can no longer find.
     evaluatorSessions.delete(goalSessionID);
-    await deleteScratchSession(cached.sessionID, ctx);
+    const failure = await deleteScratchSession(cached.sessionID, ctx);
+    // Surface the failure: swallowing it here orphans a `goal-evaluator:*`
+    // session with no notification, which is the leak this branch exists to
+    // prevent.
+    if (failure !== undefined) onWarning?.(failure);
   }
 
   const directory = await resolveLocation(goalSessionID, ctx);
@@ -537,8 +546,7 @@ export async function ensureEvaluatorSession(
   return sessionID;
 }
 
-/** Remove and forget a goal's scratch evaluator session. Returns a warning on failure. */
-/** Best-effort removal of a scratch evaluator session. Never throws. */
+/** Best-effort removal of a scratch evaluator session. Never throws; returns a warning on failure. */
 async function deleteScratchSession(
   sessionID: string,
   ctx: EvaluatorContext,
@@ -627,7 +635,13 @@ export async function evaluate(
   }
   // The candidate ceiling and the transcript bounds come from configuration, so a
   // user can bound cost/egress per evaluation (spec §9).
-  const attempts = candidates.slice(0, cfg.evaluatorMaxAttempts);
+  //
+  // `evaluate` is exported and takes `cfg` directly, so a hand-built config can
+  // carry a nonsensical limit. Clamp to at least one candidate rather than
+  // slicing to an empty list and then failing with a cause of `undefined`.
+  const rawLimit = cfg.evaluatorMaxAttempts;
+  const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.floor(rawLimit) : 1;
+  const attempts = candidates.slice(0, limit);
 
   const messages = await ctx.session.context({ sessionID: goalSessionID });
   const transcript = renderTranscript(messages, {
@@ -644,6 +658,7 @@ export async function evaluate(
         goalSessionID,
         candidate,
         ctx,
+        onWarning,
       );
       const { text } = await ctx.session.generate({
         sessionID: evaluatorSessionID,
@@ -673,7 +688,8 @@ export async function evaluate(
 /**
  * Default candidate ceiling for one evaluation before giving up (E8). The
  * effective value is `ResolvedConfig.evaluatorMaxAttempts`; this constant is the
- * default, kept exported for tests and single-source use via `DEFAULT_CONFIG`.
+ * default, exported as part of the module's surface so callers can compare
+ * against it without restating the number.
  */
 export const EVALUATOR_MAX_ATTEMPTS = DEFAULT_CONFIG.evaluatorMaxAttempts;
 

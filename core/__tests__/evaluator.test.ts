@@ -1023,8 +1023,25 @@ describe("evaluate — configured caps are used (spec §9)", () => {
     expect(generates.length).toBe(8);
   });
 
-  it("transcriptMaxMessageChars truncates a long message out of the prompt", async () => {
-    const tail = "TAIL_SENTINEL_SHOULD_BE_CUT";
+  it("clamps a nonsensical evaluatorMaxAttempts to at least one candidate (regression)", async () => {
+    const models = [model({ providerID: "ep", modelID: "em", cost: [{ output: 5 }] })];
+    for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
+      clearEvaluatorSessionCache();
+      const { ctx, generates } = evalCtx(models);
+      const verdict = await evaluate(
+        "goal-1",
+        createGoal("c"),
+        { ...baseCfg, evaluatorMaxAttempts: bad },
+        ctx,
+      );
+      // Before the clamp this sliced to an empty candidate list and threw
+      // "All evaluator candidates are unusable; last failure: undefined".
+      expect(verdict).toEqual({ kind: "met", reason: "done" });
+      expect(generates.length).toBe(1);
+    }
+  });
+
+  it("transcriptMaxMessageChars truncates a long message out of the prompt", async () => {    const tail = "TAIL_SENTINEL_SHOULD_BE_CUT";
     const longMessage = { type: "user" as const, text: "A".repeat(2000) + tail };
     const models = [model({ providerID: "ep", modelID: "em", cost: [{ output: 5 }] })];
 

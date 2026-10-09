@@ -33,6 +33,8 @@ export function installGoalKeymap(context: Context): void {
         title: "Goal: show reason",
         group: "Goal",
         bind: "ctrl+alt+g",
+        // Discoverable in the command palette (Ctrl+P), not just by binding.
+        palette: true,
         run: () => {
           void showReason(context, currentSessionID(context));
         },
@@ -42,6 +44,7 @@ export function installGoalKeymap(context: Context): void {
         title: "Goal: clear",
         group: "Goal",
         bind: "ctrl+alt+shift+g",
+        palette: true,
         run: () => {
           void confirmClear(context, currentSessionID(context));
         },

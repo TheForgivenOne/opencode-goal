@@ -22,7 +22,7 @@ import {
 } from "../config";
 
 const DOCUMENTED_DEFAULT = {
-  antiSpinThreshold: 3,
+  antiSpinThreshold: 10,
   turnCap: 50,
   evaluatorModel: undefined,
   permissiveModePolicy: "warn",
@@ -151,7 +151,7 @@ describe("antiSpinThreshold out of range → default + warning naming the value 
   for (const bad of [0, 26, -1, 100, 1000]) {
     test(`antiSpinThreshold ${bad}`, () => {
       const { config, warnings } = loadConfig({ antiSpinThreshold: bad });
-      expect(config.antiSpinThreshold).toBe(3);
+      expect(config.antiSpinThreshold).toBe(10);
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain(String(bad));
     });
@@ -183,7 +183,7 @@ describe("wrong types → default + warning (AC-39)", () => {
   for (const [label, bad] of wrongTypes) {
     test(`antiSpinThreshold accepts only integers: ${label}`, () => {
       const { config, warnings } = loadConfig({ antiSpinThreshold: bad });
-      expect(config.antiSpinThreshold).toBe(3);
+      expect(config.antiSpinThreshold).toBe(10);
       expect(warnings).toHaveLength(1);
     });
 
@@ -486,7 +486,7 @@ describe("resolveConfigFrom — a higher invalid layer must not erase a lower va
 
   test("an invalid file value warns and names its layer", () => {
     const { config, warnings } = resolveConfigFrom({ file: { antiSpinThreshold: -1 } });
-    expect(config.antiSpinThreshold).toBe(3);
+    expect(config.antiSpinThreshold).toBe(10);
     expect(warnings[0]).toContain("the goal config file");
   });
 

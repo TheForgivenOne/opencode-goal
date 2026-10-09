@@ -56,7 +56,7 @@ export interface RawConfig {
 }
 
 export const DEFAULT_CONFIG: Readonly<ResolvedConfig> = Object.freeze({
-  antiSpinThreshold: 3,
+  antiSpinThreshold: 10,
   turnCap: 50,
   evaluatorModel: undefined,
   permissiveModePolicy: "warn",

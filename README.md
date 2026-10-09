@@ -54,7 +54,7 @@ Precedence, lowest to highest:
 
 ```jsonc title=".opencode/goal.json"
 {
-  "antiSpinThreshold": 3,
+  "antiSpinThreshold": 10,
   "turnCap": 50,
   "evaluatorModel": "anthropic/claude-haiku",
   "permissiveModePolicy": "warn",
@@ -66,7 +66,7 @@ Precedence, lowest to highest:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `antiSpinThreshold` | `3` | Consecutive no-tool turns before the loop stops |
+| `antiSpinThreshold` | `10` | Consecutive **no-tool** turns before the loop stops |
 | `turnCap` | `50` | Unattended turns per run before the loop stops |
 | `evaluatorModel` | auto | `provider/model` for judging; unset picks one automatically |
 | `permissiveModePolicy` | `"warn"` | `"warn"` or `"refuse"` when a permissive mode is inferred |
@@ -112,6 +112,14 @@ with `permissiveModePolicy: "refuse"`, stops) when it infers such a mode.
 
 Guards that always apply: the anti-spin threshold, the turn cap, the out-of-band
 kill switch, and a hard stop on evaluator failure.
+
+**What stops a run.** `antiSpinThreshold` counts consecutive turns in which the
+agent used **no tool at all**. A goal whose turns call tools never reaches it;
+it fires when the agent keeps answering without doing anything — which usually
+means it cannot make progress on that condition. Reaching it is not a failure:
+the goal stays set and a plain message from you resumes the loop with a fresh
+budget. Raise `antiSpinThreshold` (up to 25) for goals that legitimately reason
+for many turns before acting.
 
 ## Requirements
 

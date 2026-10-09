@@ -188,15 +188,34 @@ function capChars(value: string, max: number): string {
 // Evaluator prompt (spec §7.3) — pure
 // ---------------------------------------------------------------------------
 
-/** The exact evaluator prompt (spec §7.3). */
+/**
+ * The exact evaluator prompt (spec §7.3).
+ *
+ * The `IMPOSSIBLE` definition is deliberately narrow. Until 2026-10-09 it read
+ * only "the condition cannot be satisfied", and a live session shows what that
+ * invited: the goal `say hi 1m times in chat` was judged IMPOSSIBLE on the
+ * reasoning that a million lines would need ~3 MB and exceed the per-message
+ * output limit — a *practical* argument that ignores the fact that this loop
+ * accumulates work across many turns. Because IMPOSSIBLE is terminal, that ended
+ * the run after one turn, which the user experienced as "it stopped nagging".
+ * The evaluator must reserve IMPOSSIBLE for impossibility already established by
+ * the transcript, and prefer NOT YET MET when in doubt.
+ */
 export function buildEvaluatorPrompt(condition: string, transcript: string): string {
   return [
     "You are a strict goal evaluator for a coding session. Decide whether the CONDITION is satisfied.",
     "",
     "Reply with EXACTLY ONE first token, then a one-sentence reason:",
-    "  MET:            the condition is satisfied",
-    "  IMPOSSIBLE:     the condition cannot be satisfied",
-    "  NOT YET MET:    more work is needed",
+    "  MET:            the condition is already satisfied by the transcript.",
+    "  IMPOSSIBLE:     the condition can never be satisfied, and the transcript already establishes why —",
+    "                  it is self-contradictory, physically impossible, or explicitly ruled out by",
+    "                  something that has happened. Reserve this label for established impossibility.",
+    "                  NOT impossible: being large, slow, laborious, expensive, or requiring many",
+    "                  turns; an agent that refused or gave up; a limit that more turns could work",
+    "                  around. This loop continues across many turns, so work accumulates — a result",
+    "                  that is merely far off is NOT YET MET, not IMPOSSIBLE. When in doubt, answer",
+    "                  NOT YET MET.",
+    "  NOT YET MET:    more work in later turns could still satisfy the condition.",
     "Your first token must be one of those three labels. Do not use tools. Judge only from the transcript.",
     "",
     "CONDITION (verbatim):",

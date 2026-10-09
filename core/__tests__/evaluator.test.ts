@@ -366,6 +366,24 @@ describe("buildEvaluatorPrompt (spec §7.3)", () => {
     const prompt = buildEvaluatorPrompt("THE-CONDITION", "THE-TRANSCRIPT");
     expect(prompt.indexOf("THE-CONDITION")).toBeLessThan(prompt.indexOf("THE-TRANSCRIPT"));
   });
+
+  // Regression: a live session judged `say hi 1m times in chat` IMPOSSIBLE because
+  // "a million lines would need ~3 MB", which ignores that the loop accumulates work
+  // across turns. IMPOSSIBLE is terminal, so that ended the run after one turn.
+  it("defines IMPOSSIBLE narrowly, so practical difficulty is not a terminal verdict", () => {
+    const prompt = buildEvaluatorPrompt("c", "t");
+    expect(prompt).toContain("NOT impossible");
+    expect(prompt).toContain("many turns");
+    expect(prompt).toContain("work accumulates");
+    expect(prompt).toContain("When in doubt");
+    // and it must say which way doubt resolves
+    expect(prompt).toMatch(/doubt, answer\s+NOT YET MET/);
+  });
+
+  it("does not invite IMPOSSIBLE with an unqualified 'cannot be satisfied'", () => {
+    const prompt = buildEvaluatorPrompt("c", "t");
+    expect(prompt).not.toContain("IMPOSSIBLE:     the condition cannot be satisfied");
+  });
 });
 
 // ---------------------------------------------------------------------------

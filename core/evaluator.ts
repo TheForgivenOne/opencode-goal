@@ -301,6 +301,17 @@ function isTextCapable(model: SelectableModel): boolean {
  * generation path rejects it), so `evaluate` must be able to walk on to the
  * next candidate when the chosen one turns out to be unusable.
  */
+/**
+ * AC-27 / AC-28 ordering, with a **paid-model preference**.
+ *
+ * Cost-ascending alone puts every `cost 0` model first. Measured live
+ * 2026-10-09: free-tier models are not usable for evaluator calls on this
+ * install — the first (`exo-free`) is retired, the next is refused with
+ * "OpenCode's free tier can only be used from within OpenCode" — so a free
+ * model leading the list makes a fresh install fail after one turn. When at
+ * least one candidate has a non-zero output cost, zero-cost candidates are
+ * therefore dropped; they are kept only when nothing else is available.
+ */
 export function selectEvaluatorCandidates(
   models: readonly SelectableModel[],
   workingModel?: WorkingModelRef | null,
@@ -326,7 +337,12 @@ export function selectEvaluatorCandidates(
     return modelIdOf(a).localeCompare(modelIdOf(b));
   });
 
-  return sorted.map((model) => ({ providerID: model.providerID, modelID: modelIdOf(model) }));
+  // Prefer paid models; fall back to free ones only if that is all there is.
+  // A missing cost is `Infinity` (see `outputCost`), so it counts as paid.
+  const paid = sorted.filter((model) => outputCost(model) > 0);
+  const ordered = paid.length > 0 ? paid : sorted;
+
+  return ordered.map((model) => ({ providerID: model.providerID, modelID: modelIdOf(model) }));
 }
 
 /** The single best evaluator model: the head of {@link selectEvaluatorCandidates}. */
@@ -492,7 +508,13 @@ export async function ensureEvaluatorSession(
     if (alive) return cached.sessionID;
     evaluatorSessions.delete(goalSessionID);
   } else if (cached !== undefined) {
+    // A different model is being tried -- typically a fallback after the
+    // previous candidate was unusable. The old scratch session can never be
+    // reached again (the cache holds one entry per goal), so remove it here
+    // rather than orphaning it: otherwise every fallback leaks a
+    // `goal-evaluator:*` session that cleanup can no longer find.
     evaluatorSessions.delete(goalSessionID);
+    await deleteScratchSession(cached.sessionID, ctx);
   }
 
   const directory = await resolveLocation(goalSessionID, ctx);
@@ -516,6 +538,19 @@ export async function ensureEvaluatorSession(
 }
 
 /** Remove and forget a goal's scratch evaluator session. Returns a warning on failure. */
+/** Best-effort removal of a scratch evaluator session. Never throws. */
+async function deleteScratchSession(
+  sessionID: string,
+  ctx: EvaluatorContext,
+): Promise<string | undefined> {
+  try {
+    await ctx.session.remove({ sessionID });
+    return undefined;
+  } catch (err) {
+    return `Failed to remove evaluator session ${sessionID}: ${describeError(err)}`;
+  }
+}
+
 export async function removeEvaluatorSession(
   goalSessionID: string,
   ctx: EvaluatorContext,
@@ -523,12 +558,7 @@ export async function removeEvaluatorSession(
   const cached = evaluatorSessions.get(goalSessionID);
   if (cached === undefined) return undefined;
   evaluatorSessions.delete(goalSessionID);
-  try {
-    await ctx.session.remove({ sessionID: cached.sessionID });
-    return undefined;
-  } catch (err) {
-    return `Failed to remove evaluator session ${cached.sessionID}: ${describeError(err)}`;
-  }
+  return deleteScratchSession(cached.sessionID, ctx);
 }
 
 /** The goal session's directory when readable, else the plugin location. */
@@ -649,6 +679,24 @@ function sameModel(a: EvaluatorModelRef, b: EvaluatorModelRef): boolean {
  * `Model exo-free has been deprecated.` Only this family is retryable;
  * everything else (network, quota, malformed request) must propagate untouched.
  */
+/**
+ * True when the error means **this endpoint cannot serve us** rather than the
+ * request being bad, so trying the next candidate is worthwhile.
+ *
+ * Four distinct causes were observed live (2026-10-09) while auto-selecting by
+ * cost — each on a different cheap tier, which is why cost alone is not a safe
+ * proxy for availability:
+ *
+ *   - `Model exo-free has been deprecated.`                          (retired)
+ *   - `OpenCode's free tier can only be used from within OpenCode.`   (free tier)
+ *   - `Upstream request failed: This Go model trains on request data.
+ *      Allow paid endpoints that train on request data in your
+ *      workspace's Privacy settings to use it.`                      (opt-in)
+ *
+ * Transport-level wording is deliberately excluded — `network unreachable` must
+ * fail fast rather than burn all five attempts on a cause that is not
+ * model-specific. See `evaluate`.
+ */
 export function isModelUnusableError(err: unknown): boolean {
   const message = describeError(err).toLowerCase();
   return (
@@ -657,7 +705,10 @@ export function isModelUnusableError(err: unknown): boolean {
     message.includes("not found") ||
     message.includes("unknown") ||
     message.includes("no such model") ||
-    message.includes("does not exist")
+    message.includes("does not exist") ||
+    message.includes("free tier") ||
+    message.includes("trains on request data") ||
+    message.includes("privacy settings")
   );
 }
 

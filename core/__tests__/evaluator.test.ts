@@ -23,6 +23,8 @@ import {
   renderTranscript,
   resolveEvaluatorModel,
   selectEvaluatorModel,
+  selectEvaluatorCandidates,
+  isModelUnusableError,
   type EvaluatorContext,
   type SelectableModel,
   type WorkingModelRef,
@@ -456,6 +458,74 @@ describe("selectEvaluatorModel (spec §7.2, AC-27/28)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Paid-model preference. Live 2026-10-09: cost-ascending alone put a retired
+// free model first and the loop died after one turn. Free models are demoted
+// when any paid candidate exists, and kept only when nothing else is available.
+// ---------------------------------------------------------------------------
+
+describe("evaluator selection — paid preference", () => {
+  it("prefers a paid model over a cheaper free one", () => {
+    const models = [
+      model({ providerID: "a", modelID: "totally-free", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "paid", cost: [{ output: 9 }] }),
+    ];
+    expect(selectEvaluatorModel(models)).toEqual({ providerID: "b", modelID: "paid" });
+  });
+
+  it("still picks the cheapest PAID model", () => {
+    const models = [
+      model({ providerID: "a", modelID: "free", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "pricey", cost: [{ output: 30 }] }),
+      model({ providerID: "c", modelID: "cheap", cost: [{ output: 0.5 }] }),
+    ];
+    expect(selectEvaluatorModel(models)).toEqual({ providerID: "c", modelID: "cheap" });
+  });
+
+  it("drops free models from the whole candidate list when paid ones exist", () => {
+    const models = [
+      model({ providerID: "a", modelID: "free-1", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "free-2", cost: [{ output: 0 }] }),
+      model({ providerID: "c", modelID: "paid", cost: [{ output: 4 }] }),
+    ];
+    const ids = selectEvaluatorCandidates(models).map((m) => m.modelID);
+    expect(ids).toEqual(["paid"]);
+  });
+
+  it("falls back to free models when NOTHING paid is available", () => {
+    const models = [
+      model({ providerID: "a", modelID: "free-b", cost: [{ output: 0 }] }),
+      model({ providerID: "a", modelID: "free-a", cost: [{ output: 0 }] }),
+    ];
+    expect(selectEvaluatorModel(models)).toEqual({ providerID: "a", modelID: "free-a" });
+  });
+
+  it("treats a missing cost as paid (not dropped)", () => {
+    const models = [
+      model({ providerID: "a", modelID: "free", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "unknown-cost" }),
+    ];
+    expect(selectEvaluatorModel(models)).toEqual({ providerID: "b", modelID: "unknown-cost" });
+  });
+
+  it("excludes the working model, then falls back to a free candidate as a last resort", () => {
+    const working: WorkingModelRef = { providerID: "b", modelID: "paid" };
+    const models = [
+      model({ providerID: "a", modelID: "free", cost: [{ output: 0 }] }),
+      model({ providerID: "b", modelID: "paid", cost: [{ output: 4 }] }),
+    ];
+    // The paid working model is excluded; nothing paid remains, so the free
+    // model is returned rather than yielding no evaluator at all.
+    expect(selectEvaluatorModel(models, working)).toEqual({ providerID: "a", modelID: "free" });
+  });
+
+  it("returns undefined when the working model is the only paid candidate and free ones are excluded", () => {
+    const working: WorkingModelRef = { providerID: "b", modelID: "paid" };
+    const models = [model({ providerID: "b", modelID: "paid", cost: [{ output: 4 }] })];
+    expect(selectEvaluatorModel(models, working)).toBeUndefined();
+  });
+});
+
 describe("findModelById (spec §7.2)", () => {
   const models = [
     model({ providerID: "openai", modelID: "gpt-4o", cost: [{ output: 10 }] }),
@@ -582,6 +652,7 @@ interface FakeEvalCtx {
   ctx: EvaluatorContext;
   creates: Record<string, unknown>[];
   generates: { sessionID: string; prompt: string }[];
+  removes: string[];
 }
 
 function evalCtx(
@@ -590,6 +661,7 @@ function evalCtx(
 ): FakeEvalCtx {
   const creates: Record<string, unknown>[] = [];
   const generates: { sessionID: string; prompt: string }[] = [];
+  const removes: string[] = [];
   const alive = new Set<string>(["goal-1"]);
   const ctx = {
     location: { directory: "/repo" },
@@ -610,6 +682,7 @@ function evalCtx(
         return { id };
       },
       remove: async ({ sessionID }: { sessionID: string }) => {
+        removes.push(sessionID);
         alive.delete(sessionID);
       },
       context: async () => [{ type: "user", text: "hello" }],
@@ -620,7 +693,7 @@ function evalCtx(
       },
     },
   } as unknown as EvaluatorContext;
-  return { ctx, creates, generates };
+  return { ctx, creates, generates, removes };
 }
 
 const EVAL_REF = { providerID: "ep", modelID: "em" };
@@ -715,7 +788,7 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
   };
 
   const twoCandidates = (): SelectableModel[] => [
-    model({ providerID: "a", modelID: "first", cost: [{ output: 0 }] }),
+    model({ providerID: "a", modelID: "first", cost: [{ output: 1 }] }),
     model({ providerID: "b", modelID: "second", cost: [{ output: 5 }] }),
   ];
 
@@ -754,7 +827,7 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
 
   it("throws the last failure when every candidate is unusable", async () => {
     const models = [
-      model({ providerID: "a", modelID: "one", cost: [{ output: 0 }] }),
+      model({ providerID: "a", modelID: "one", cost: [{ output: 0.5 }] }),
       model({ providerID: "b", modelID: "two", cost: [{ output: 1 }] }),
       model({ providerID: "c", modelID: "three", cost: [{ output: 2 }] }),
     ];
@@ -769,7 +842,7 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
 
   it("caps attempts at five even when more candidates are listed", async () => {
     const models = Array.from({ length: 7 }, (_, i) =>
-      model({ providerID: "p", modelID: `m${i}`, cost: [{ output: i }] }),
+      model({ providerID: "p", modelID: `m${i}`, cost: [{ output: i + 1 }] }),
     );
     const { ctx, generates } = evalCtx(models, () => {
       throw new Error("Model m0 has been retired.");
@@ -794,7 +867,7 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
   it("tries an explicitly configured model first, then falls back with a warning", async () => {
     const models = [
       model({ providerID: "ep", modelID: "pinned", cost: [{ output: 99 }] }),
-      model({ providerID: "a", modelID: "cheap", cost: [{ output: 0 }] }),
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 0.5 }] }),
     ];
     const pinned: ResolvedConfig = { ...cfg, evaluatorModel: "ep/pinned" };
     const { ctx, generates } = evalCtx(models, (_input, i) => {
@@ -808,5 +881,90 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
     expect(
       warnings.some((w) => w.includes("ep/pinned is unusable") && w.includes("a/cheap")),
     ).toBe(true);
+  });
+
+  it("falls back past a free-tier restriction (observed live)", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates(), (_input, i) => {
+      if (i === 0) {
+        throw new Error("OpenCode's free tier can only be used from within OpenCode.");
+      }
+      return { text: "MET: done" };
+    });
+    const warnings: string[] = [];
+    const verdict = await evaluate("goal-1", createGoal("c"), cfg, ctx, (m) => warnings.push(m));
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(2);
+    expect(warnings.length).toBe(1);
+  });
+
+  it("falls back past a privacy/training opt-in refusal (observed live)", async () => {
+    const { ctx, generates } = evalCtx(twoCandidates(), (_input, i) => {
+      if (i === 0) {
+        throw new Error(
+          "Upstream request failed: This Go model trains on request data. Allow paid " +
+            "endpoints that train on request data in your workspace's Privacy settings to use it.",
+        );
+      }
+      return { text: "MET: done" };
+    });
+    const warnings: string[] = [];
+    const verdict = await evaluate("goal-1", createGoal("c"), cfg, ctx, (m) => warnings.push(m));
+    expect(verdict).toEqual({ kind: "met", reason: "done" });
+    expect(generates.length).toBe(2);
+    expect(warnings.length).toBe(1);
+  });
+
+  it("removes the superseded scratch session when a fallback switches model", async () => {
+    const { ctx, generates, removes, creates } = evalCtx(twoCandidates(), (_input, i) => {
+      if (i === 0) throw new Error("Model first has been deprecated.");
+      return { text: "MET: done" };
+    });
+    await evaluate("goal-1", createGoal("c"), cfg, ctx);
+    // one scratch session per candidate ...
+    expect(creates.length).toBe(2);
+    // ... and the abandoned one is removed, not orphaned
+    expect(removes).toEqual([generates[0].sessionID]);
+    expect(generates[0].sessionID).not.toBe(generates[1].sessionID);
+  });
+
+  it("reuses the scratch session when the model is unchanged", async () => {
+    const { ctx, removes, creates } = evalCtx(twoCandidates());
+    await evaluate("goal-1", createGoal("c"), cfg, ctx);
+    await evaluate("goal-1", createGoal("c"), cfg, ctx);
+    expect(creates.length).toBe(1);
+    expect(removes.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isModelUnusableError — the retryable/terminal split (live-observed causes)
+// ---------------------------------------------------------------------------
+
+describe("isModelUnusableError", () => {
+  it("is retryable for every cause observed live", () => {
+    expect(isModelUnusableError(new Error("Model exo-free has been deprecated."))).toBe(true);
+    expect(isModelUnusableError(new Error("Model X has been retired."))).toBe(true);
+    expect(
+      isModelUnusableError(new Error("OpenCode's free tier can only be used from within OpenCode.")),
+    ).toBe(true);
+    expect(
+      isModelUnusableError(new Error("This Go model trains on request data.")),
+    ).toBe(true);
+    expect(
+      isModelUnusableError(new Error("Allow paid endpoints ... Privacy settings to use it.")),
+    ).toBe(true);
+    expect(isModelUnusableError(new Error("unknown model"))).toBe(true);
+  });
+
+  it("is terminal for transport and unrelated errors", () => {
+    expect(isModelUnusableError(new Error("network unreachable"))).toBe(false);
+    expect(isModelUnusableError(new Error("rate limit exceeded"))).toBe(false);
+    expect(isModelUnusableError(new Error("Invalid prompt schema"))).toBe(false);
+  });
+
+  it("does not crash on a non-Error throw", () => {
+    expect(isModelUnusableError("Model X has been deprecated.")).toBe(true);
+    expect(isModelUnusableError(undefined)).toBe(false);
+    expect(isModelUnusableError({ nope: 1 })).toBe(false);
   });
 });

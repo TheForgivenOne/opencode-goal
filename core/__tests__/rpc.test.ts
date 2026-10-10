@@ -86,6 +86,7 @@ describe("goalRpc schemas validate at runtime (spec §6.2)", () => {
     const valid = {
       antiSpinThreshold: 3,
       turnCap: 50,
+      turnWaitMaxMs: 120_000,
       permissiveModePolicy: "warn",
       transcriptMaxMessageChars: 8000,
       transcriptMaxTotalChars: 48000,
@@ -99,6 +100,7 @@ describe("goalRpc schemas validate at runtime (spec §6.2)", () => {
     // ...and they are REQUIRED, not optional: making one optional in the schema
     // must not silently pass (independent-review finding T2).
     for (const key of [
+      "turnWaitMaxMs",
       "transcriptMaxMessageChars",
       "transcriptMaxTotalChars",
       "evaluatorMaxAttempts",

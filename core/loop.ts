@@ -540,32 +540,40 @@ export async function waitForTurnEnd(
   runAbort: AbortSignal,
   maxMs: number,
 ): Promise<"idle" | "timeout" | "aborted"> {
-  if (maxMs <= 0) {
-    await deps.ctx.session.wait({ sessionID });
-    return runAbort.aborted ? "aborted" : "idle";
-  }
-
   const controller = new AbortController();
   const onRunAbort = (): void => controller.abort();
-  runAbort.addEventListener("abort", onRunAbort, { once: true });
+  // An abort that already happened must be honoured too: `addEventListener` on an
+  // already-aborted signal never fires, so the wait would run to its cap instead.
+  if (runAbort.aborted) controller.abort();
+  else runAbort.addEventListener("abort", onRunAbort, { once: true });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), maxMs);
-  });
-
-  const waited = deps.ctx.session
-    .wait({ sessionID }, { signal: controller.signal })
-    .then(() => "idle" as const)
-    .catch((error: unknown) => {
-      if (runAbort.aborted) return "aborted" as const;
-      throw error;
-    });
-
   try {
-    const outcome = await Promise.race([waited, timedOut]);
-    // Cancel the request when the cap wins. The race already holds a handler for
-    // `waited`, so a late rejection cannot surface as unhandled.
+    // `maxMs <= 0` is the documented escape hatch back to an unbounded wait — still
+    // wired to the run's abort, so `clear` can cancel it.
+    const timedOut =
+      maxMs > 0
+        ? new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), maxMs);
+          })
+        : undefined;
+
+    // Built inside the `try`: a synchronous throw from `wait` (or a non-promise
+    // return) must still run the cleanup below rather than leak the timer and the
+    // abort listener.
+    const waited = deps.ctx.session
+      .wait({ sessionID }, { signal: controller.signal })
+      .then(() => "idle" as const)
+      .catch((error: unknown) => {
+        if (runAbort.aborted) return "aborted" as const;
+        throw error;
+      });
+
+    const outcome =
+      timedOut === undefined ? await waited : await Promise.race([waited, timedOut]);
+    // Cancel the request when the cap wins. The race holds a handler for `waited`,
+    // so a late rejection cannot surface as unhandled — which also means an error
+    // that arrives *after* the cap is treated as a turn end (see the note below).
     if (outcome === "timeout") controller.abort();
     return outcome;
   } finally {

@@ -8,7 +8,7 @@
  * (every evaluation doubled, two directives injected with no turn between them).
  */
 import { describe, expect, test } from "bun:test";
-import { isDuplicateInvocation, sharedMap } from "../shared";
+import { forgetSessionInvocations, isDuplicateInvocation, sharedMap } from "../shared";
 
 const host = globalThis as unknown as Record<string, unknown>;
 
@@ -81,5 +81,42 @@ describe("isDuplicateInvocation", () => {
     expect(isDuplicateInvocation(key, 2000, 1000)).toBe(false);
     expect(sharedMap<string, number>("invocations").has(key)).toBe(true);
     expect(isDuplicateInvocation(key, 2000, 1010)).toBe(true);
+  });
+
+  test("stale records are pruned on every call, not only once the map grows", () => {
+    const seen = sharedMap<string, number>("invocations");
+    isDuplicateInvocation("dedupe-prune-a", 1000, 1000);
+    expect(seen.has("dedupe-prune-a")).toBe(true);
+    isDuplicateInvocation("dedupe-prune-b", 1000, 2500); // the first is now outside the window
+    expect(seen.has("dedupe-prune-a")).toBe(false);
+  });
+
+  // Review finding D1, demonstrated: the window cannot tell "one action delivered
+  // twice" from "the same command issued twice on purpose", so `/goal clear` then a
+  // re-set of the same condition was swallowed — the goal stayed cleared and the user
+  // saw nothing, which is the reported "it just disappears" symptom.
+  test("a clear can be followed immediately by a re-set of the same condition", () => {
+    const S = "dedupe-clear";
+    const setKey = `${S}\u0000/goal write the report`;
+    const clearKey = `${S}\u0000/goal clear`;
+    expect(isDuplicateInvocation(setKey, 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation(clearKey, 2000, 1200)).toBe(false);
+    forgetSessionInvocations(S, clearKey);
+    expect(isDuplicateInvocation(setKey, 2000, 1500)).toBe(false); // the re-set runs
+  });
+
+  test("a duplicate clear is still collapsed, so it prints one line rather than two", () => {
+    const S = "dedupe-clear-dup";
+    const clearKey = `${S}\u0000/goal clear`;
+    expect(isDuplicateInvocation(clearKey, 2000, 1000)).toBe(false);
+    forgetSessionInvocations(S, clearKey); // keeps the clearing invocation's own key
+    expect(isDuplicateInvocation(clearKey, 2000, 1050)).toBe(true);
+  });
+
+  test("forgetSessionInvocations leaves another session's records alone", () => {
+    expect(isDuplicateInvocation("dedupe-a\u0000/goal x", 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation("dedupe-b\u0000/goal x", 2000, 1000)).toBe(false);
+    forgetSessionInvocations("dedupe-a");
+    expect(isDuplicateInvocation("dedupe-b\u0000/goal x", 2000, 1010)).toBe(true);
   });
 });

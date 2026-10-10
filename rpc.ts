@@ -54,6 +54,8 @@ export const goalRpc = Rpc.define({
       output: Schema.Struct({
         antiSpinThreshold: Schema.Number,
         turnCap: Schema.Number,
+        /** Turn-end wait cap in ms (spec §4.2); `0` means unbounded. */
+        turnWaitMaxMs: Schema.Number,
         evaluatorModel: Schema.optional(Schema.String),
         /** Spec §7.2: the resolved `provider/model`, surfaced for the TUI. */
         resolvedEvaluatorModel: Schema.optional(Schema.String),

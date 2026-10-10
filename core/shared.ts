@@ -61,12 +61,32 @@ export function isDuplicateInvocation(
   now: number = Date.now(),
 ): boolean {
   const seen = sharedMap<string, number>("invocations");
+  // Prune on every call, so the map is bounded by the live window rather than by how
+  // many distinct commands have been issued. An entry older than the window is gone
+  // before the lookup, which is exactly the "outside the window" case.
+  for (const [candidate, at] of seen) {
+    if (now - at > windowMs) seen.delete(candidate);
+  }
   const previous = seen.get(key);
   seen.set(key, now);
-  if (seen.size > 64) {
-    for (const [candidate, at] of seen) {
-      if (now - at > windowMs) seen.delete(candidate);
-    }
+  return previous !== undefined;
+}
+
+/**
+ * Drop this session's invocation records, keeping `keepKey` when given.
+ *
+ * A time window cannot distinguish "one user action delivered twice" from "the same
+ * command issued twice on purpose". The case that matters: `/goal clear` followed
+ * quickly by a re-set of the **same** condition would be swallowed, leaving the goal
+ * cleared with no output — the very "it just disappears" symptom this guard exists to
+ * prevent. Clearing the session's records makes that re-set run. The clearing
+ * invocation's own key is kept so a duplicate `clear` is still collapsed, rather than
+ * emitting a second "no goal set" line.
+ */
+export function forgetSessionInvocations(sessionID: string, keepKey?: string): void {
+  const seen = sharedMap<string, number>("invocations");
+  const prefix = `${sessionID}\u0000`;
+  for (const key of [...seen.keys()]) {
+    if (key !== keepKey && key.startsWith(prefix)) seen.delete(key);
   }
-  return previous !== undefined && now - previous <= windowMs;
 }

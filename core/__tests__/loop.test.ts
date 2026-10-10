@@ -109,6 +109,11 @@ describe("waitForTurnEnd (§4.2)", () => {
     const wait = (_input: unknown, options?: { signal?: AbortSignal }): Promise<void> => {
       seen.signal = options?.signal;
       return new Promise<void>((_resolve, reject) => {
+        // `fetch` rejects at once when handed a signal that is already aborted.
+        if (options?.signal?.aborted === true) {
+          reject(new Error("AbortError"));
+          return;
+        }
         options?.signal?.addEventListener("abort", () => reject(new Error("AbortError")), {
           once: true,
         });
@@ -146,6 +151,50 @@ describe("waitForTurnEnd (§4.2)", () => {
   it("turnWaitMaxMs 0 restores the unbounded wait", async () => {
     const deps = waitDeps(async () => {});
     expect(await waitForTurnEnd(deps, "ses_unbounded", new AbortController().signal, 0)).toBe("idle");
+  });
+
+  // Review finding D2: the unbounded branch used to call `wait` with no signal at all,
+  // so a run abort was not merely late — it was unobservable.
+  it("turnWaitMaxMs 0 is still wired to the run abort", async () => {
+    const { wait, seen } = signalAwareWait();
+    const run = new AbortController();
+    const pending = waitForTurnEnd(waitDeps(wait), "ses_unbounded_abort", run.signal, 0);
+    run.abort();
+    expect(await pending).toBe("aborted");
+    expect(seen.signal).toBeDefined();
+  });
+
+  // Review finding D3: `addEventListener` on an already-aborted signal never fires.
+  it("honours a run abort that landed before the wait started", async () => {
+    const { wait, seen } = signalAwareWait();
+    const run = new AbortController();
+    run.abort();
+    expect(await waitForTurnEnd(waitDeps(wait), "ses_pre_aborted", run.signal, 60_000)).toBe(
+      "aborted",
+    );
+    expect(seen.signal?.aborted).toBe(true);
+  });
+
+  // Review finding D4: `waited` was built before the `try`, so a synchronous throw
+  // skipped the `finally` and leaked the timer and the abort listener.
+  it("does not leak the abort listener when wait throws synchronously", async () => {
+    let added = 0;
+    let removed = 0;
+    const fake = {
+      aborted: false,
+      addEventListener: () => {
+        added += 1;
+      },
+      removeEventListener: () => {
+        removed += 1;
+      },
+    } as unknown as AbortSignal;
+    const deps = waitDeps(() => {
+      throw new Error("sync boom");
+    });
+    await expect(waitForTurnEnd(deps, "ses_sync", fake, 1000)).rejects.toThrow("sync boom");
+    expect(added).toBe(1);
+    expect(removed).toBe(1);
   });
 
   it("a genuine wait error still propagates, so the E8 failure path handles it", async () => {

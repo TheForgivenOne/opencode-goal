@@ -72,7 +72,7 @@ import {
 } from "./core/parser";
 import { readGoal, scanGoals } from "./core/store";
 import { installWatchers, type WatchContext } from "./core/watch";
-import { INVOCATION_DEDUPE_MS, isDuplicateInvocation } from "./core/shared";
+import { INVOCATION_DEDUPE_MS, forgetSessionInvocations, isDuplicateInvocation } from "./core/shared";
 
 import type { Plugin } from "@opencode/plugin";
 import type { RpcRegistration } from "@opencode/plugin/promise/rpc";
@@ -317,6 +317,7 @@ export default {
           return {
             antiSpinThreshold: config.antiSpinThreshold,
             turnCap: config.turnCap,
+            turnWaitMaxMs: config.turnWaitMaxMs,
             ...(config.evaluatorModel !== undefined ? { evaluatorModel: config.evaluatorModel } : {}),
             ...(resolvedEvaluatorModel !== undefined ? { resolvedEvaluatorModel } : {}),
             ...(evaluatorProvider !== undefined ? { evaluatorProvider } : {}),
@@ -380,6 +381,12 @@ export default {
 
             case "clear": {
               const result = await clearGoal(sessionID, deps);
+              // A clear ends the session's previous goal, so a re-set of the *same*
+              // condition must not be mistaken for a duplicate of the earlier one
+              // (`forgetSessionInvocations`). This invocation's own key is kept, so a
+              // duplicate `clear` is still collapsed instead of printing a second
+              // "no goal set" line.
+              forgetSessionInvocations(sessionID, invocationKey);
               await output(
                 sessionID,
                 result.cleared && result.condition !== undefined

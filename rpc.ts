@@ -32,6 +32,12 @@ export const goalRpc = Rpc.define({
       input: Schema.Struct({ sessionID: Schema.String }),
       output: Schema.Struct({
         kind: Schema.Literals(["none", "active", "achieved", "failed"]),
+        /**
+         * Is the driver loop actually running? A goal can be `active` yet dormant —
+         * paused by a new conversation, anti-spin, the turn cap or a kill switch —
+         * and the indicator must be able to say so (spec §6.3).
+         */
+        running: Schema.optional(Schema.Boolean),
         condition: Schema.optional(Schema.String),
         elapsedMs: Schema.optional(Schema.Number),
         turnsEvaluated: Schema.optional(Schema.Number),

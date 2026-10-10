@@ -29,10 +29,100 @@ export function themeToken(theme: unknown, ...path: readonly string[]): string |
 /**
  * The colour for a goal-state label. `active` is informational, not an error;
  * a running unattended loop is signalled by the condition text, not by red.
+ * `paused` — a goal that is set but has no loop running — is a warning: nothing is
+ * happening, and that is exactly what the user needs to see.
  */
-export function statusColour(theme: unknown, kind: "active" | "achieved" | "failed"): string | undefined {
-  const feedback = kind === "achieved" ? "success" : kind === "failed" ? "error" : "info";
+export function statusColour(
+  theme: unknown,
+  kind: "active" | "paused" | "achieved" | "failed",
+): string | undefined {
+  const feedback =
+    kind === "achieved"
+      ? "success"
+      : kind === "failed"
+        ? "error"
+        : kind === "paused"
+          ? "warning"
+          : "info";
   return themeToken(theme, "text", "feedback", feedback, "base");
+}
+
+/**
+ * The status view the indicator renders. Mirrors the RPC `status` output (§6.2).
+ */
+export interface GoalStatusView {
+  readonly kind: "none" | "active" | "achieved" | "failed";
+  /** `false` means the goal is set but its loop is not running (§6.3). */
+  readonly running?: boolean;
+  readonly condition?: string;
+  readonly elapsedMs?: number;
+  readonly turnsEvaluated?: number;
+  readonly tokensSpent?: number;
+  readonly lastReason?: string;
+}
+
+/** Compact duration, as the indicator shows it. */
+export function formatDuration(ms: number): string {
+  const clamped = Math.max(0, ms);
+  const totalSeconds = Math.floor(clamped / 1000);
+  if (totalSeconds < 1) return `${Math.round(clamped)}ms`;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+/**
+ * The elapsed time to show.
+ *
+ * Only a **running** goal ticks. A goal that is `active` but dormant — paused by a
+ * new conversation, anti-spin, the turn cap or a kill switch — has no work in
+ * progress, and a locally-ticking clock made it look busy. That is the live report
+ * "`turn 0, 0 tokens, 34s`": the loop had been paused 4 seconds in, and the display
+ * kept counting for half a minute as though it were still working.
+ *
+ * `running === undefined` (an older server that does not send the field) ticks, which
+ * is the previous behaviour.
+ */
+export function indicatorElapsed(
+  view: GoalStatusView,
+  baseElapsedMs: number,
+  baseAt: number,
+  now: number,
+): number {
+  if (view.kind !== "active") return view.elapsedMs ?? 0;
+  if (view.running === false) return view.elapsedMs ?? 0;
+  return baseElapsedMs + Math.max(0, now - baseAt);
+}
+
+/** The indicator's one-line label (§6.3). */
+export function indicatorLabel(view: GoalStatusView, elapsedMs: number): string {
+  if (view.kind === "none") return "";
+  const turns = view.turnsEvaluated ?? 0;
+  const spend = view.tokensSpent ?? 0;
+  const condition = view.condition ?? "";
+  switch (view.kind) {
+    case "active":
+      return view.running === false
+        ? `[goal] paused: ${condition} — ${turns} turn(s), ${spend} tokens, ${formatDuration(elapsedMs)}; send a message to resume`
+        : `[goal] ${condition} — turn ${turns}, ${spend} tokens, ${formatDuration(elapsedMs)}`;
+    case "achieved":
+      return `[goal] achieved: ${condition} — ${turns} turn(s), ${spend} tokens`;
+    case "failed":
+      return `[goal] failed: ${condition} — ${view.lastReason ?? ""}`;
+    default:
+      return "";
+  }
+}
+
+/** The colour kind for a status view; a dormant active goal is `paused`. */
+export function statusColourKind(
+  view: GoalStatusView,
+): "active" | "paused" | "achieved" | "failed" {
+  if (view.kind === "active" && view.running === false) return "paused";
+  return view.kind === "none" ? "active" : view.kind;
 }
 
 /**

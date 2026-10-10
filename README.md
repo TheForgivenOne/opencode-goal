@@ -166,7 +166,16 @@ touch <project>/.opencode/goal.kill   # or a file
 
 ## TUI
 
-While a goal is active an indicator renders above the composer.
+While a goal is active an indicator renders above the composer:
+
+```
+[goal] refactor the parser — turn 3, 12400 tokens, 2m 11s
+[goal] paused: refactor the parser — 3 turn(s), 12400 tokens, 2m 11s; send a message to resume
+```
+
+The second form matters: a goal can be **set but not running** — paused by a new
+conversation, anti-spin, the turn cap or a kill switch — and the clock stops when it
+does. A ticking timer for a stopped loop reads as work in progress.
 
 | Binding | Action |
 |---|---|

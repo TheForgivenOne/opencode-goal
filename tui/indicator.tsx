@@ -6,12 +6,14 @@
  * `changed` event. Reads are best-effort — a failed RPC must never break the
  * composer.
  *
- * Presentation notes (2026-10-09):
+ * Presentation notes:
  *  - Colours come from semantic theme tokens so the indicator follows the active
  *    theme, and degrade to the default foreground if a token is missing.
- *  - The elapsed time ticks locally between RPC reads. Without it a long
- *    unattended turn looks frozen, because the RPC only reports elapsed time
- *    when it is polled.
+ *  - The elapsed time ticks locally between RPC reads, **but only while the loop is
+ *    actually running**. A goal can be `active` and dormant at the same time, and a
+ *    ticking clock for a stopped loop was read as work in progress (live report:
+ *    "`turn 0, 0 tokens, 34s`"). The label logic lives in `./text` so it is testable
+ *    without a renderer.
  *  - The line is fitted to the terminal width; an unknown width renders
  *    untruncated rather than hiding the indicator.
  */
@@ -19,33 +21,20 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { usePlugin } from "@opencode/plugin/tui";
 import { portableGoalRpc } from "../rpc";
-import { fitToWidth, statusColour, WIDTH_MARGIN } from "./text";
-
-type GoalStatusView = {
-  kind: "none" | "active" | "achieved" | "failed";
-  condition?: string;
-  elapsedMs?: number;
-  turnsEvaluated?: number;
-  tokensSpent?: number;
-  lastReason?: string;
-};
-
-function formatDuration(ms: number): string {
-  const clamped = Math.max(0, ms);
-  const totalSeconds = Math.floor(clamped / 1000);
-  if (totalSeconds < 1) return `${Math.round(clamped)}ms`;
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
+import {
+  fitToWidth,
+  indicatorElapsed,
+  indicatorLabel,
+  statusColour,
+  statusColourKind,
+  type GoalStatusView,
+  WIDTH_MARGIN,
+} from "./text";
 
 export function GoalIndicator(props: { sessionID: string }) {
   const context = usePlugin();
   const [status, setStatus] = createSignal<GoalStatusView>({ kind: "none" });
-  /** Ticking clock; only read while a goal is active. */
+  /** Ticking clock; only read while a goal is active *and* running. */
   const [clock, setClock] = createSignal(Date.now());
   /** Elapsed time reported by the last successful read, and when it was read. */
   let baseElapsedMs = 0;
@@ -81,40 +70,13 @@ export function GoalIndicator(props: { sessionID: string }) {
     });
   });
 
-  /** Elapsed time, advanced locally while a goal is active. */
-  const elapsed = (): number => {
-    const current = status();
-    if (current.kind !== "active") return current.elapsedMs ?? 0;
-    return baseElapsedMs + Math.max(0, clock() - baseAt);
-  };
-
-  const label = (): string => {
-    const current = status();
-    if (current.kind === "none") return "";
-    const turns = current.turnsEvaluated ?? 0;
-    const spend = current.tokensSpent ?? 0;
-    const condition = current.condition ?? "";
-    switch (current.kind) {
-      case "active":
-        return `[goal] ${condition} — turn ${turns}, ${spend} tokens, ${formatDuration(elapsed())}`;
-      case "achieved":
-        return `[goal] achieved: ${condition} — ${turns} turn(s), ${spend} tokens`;
-      case "failed":
-        return `[goal] failed: ${condition} — ${current.lastReason ?? ""}`;
-      default:
-        return "";
-    }
-  };
-
-  const colour = (): string | undefined => {
-    const kind = status().kind;
-    if (kind === "none") return undefined;
-    return statusColour(context.theme, kind);
-  };
-
   /** Fit to the composer width; an unknown width renders the label whole. */
   const fitted = (): string => {
-    const text = label();
+    const current = status();
+    const text = indicatorLabel(
+      current,
+      indicatorElapsed(current, baseElapsedMs, baseAt, clock()),
+    );
     const columns = context.renderer?.width ?? 0;
     if (!Number.isFinite(columns) || columns <= WIDTH_MARGIN) return text;
     return fitToWidth(text, columns - WIDTH_MARGIN);
@@ -122,7 +84,7 @@ export function GoalIndicator(props: { sessionID: string }) {
 
   return (
     <Show when={status().kind !== "none"}>
-      <text fg={colour()}>{fitted()}</text>
+      <text fg={statusColour(context.theme, statusColourKind(status()))}>{fitted()}</text>
     </Show>
   );
 }

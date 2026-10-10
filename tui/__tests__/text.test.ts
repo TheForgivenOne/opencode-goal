@@ -6,7 +6,15 @@
  * (the older core-only glob, `…/core/__tests__/`, will not pick these up).
  */
 import { describe, expect, test } from "bun:test";
-import { fitToWidth, statusColour, themeToken, WIDTH_MARGIN } from "../text";
+import {
+  fitToWidth,
+  indicatorElapsed,
+  indicatorLabel,
+  statusColour,
+  statusColourKind,
+  themeToken,
+  WIDTH_MARGIN,
+} from "../text";
 
 const theme = {
   text: {
@@ -104,5 +112,64 @@ describe("WIDTH_MARGIN", () => {
   test("leaves a usable gap at the terminal edge", () => {
     expect(WIDTH_MARGIN).toBeGreaterThan(0);
     expect(WIDTH_MARGIN).toBeLessThan(20);
+  });
+});
+
+/**
+ * §6.3 indicator content. `active` is the goal; `running` is the loop. They differ
+ * whenever the loop has stopped and the goal remains set, and conflating them is what
+ * produced the live report "`turn 0, 0 tokens, 34s`" — a ticking clock for a loop that
+ * had already been paused.
+ */
+describe("indicatorLabel / indicatorElapsed (§6.3)", () => {
+  const running = {
+    kind: "active" as const,
+    running: true,
+    condition: "say hi",
+    elapsedMs: 5000,
+    turnsEvaluated: 2,
+    tokensSpent: 1500,
+  };
+  const paused = { ...running, running: false };
+
+  test("a running goal shows the live line, and its clock ticks locally", () => {
+    expect(indicatorLabel(running, 34_000)).toBe("[goal] say hi — turn 2, 1500 tokens, 34s");
+    expect(indicatorElapsed(running, 5000, 1000, 7000)).toBe(11_000);
+  });
+
+  test("a paused goal says so, and its clock does NOT tick", () => {
+    const label = indicatorLabel(paused, 5000);
+    expect(label).toContain("paused");
+    expect(label).toContain("send a message to resume");
+    // The regression: this used to advance to 44s while nothing was running.
+    expect(indicatorElapsed(paused, 5000, 1000, 40_000)).toBe(5000);
+  });
+
+  test("an older server that omits `running` keeps the previous ticking behaviour", () => {
+    const legacy = { kind: "active" as const, condition: "c", elapsedMs: 1000 };
+    expect(indicatorElapsed(legacy, 1000, 1000, 5000)).toBe(5000);
+    expect(indicatorLabel(legacy, 5000)).not.toContain("paused");
+  });
+
+  test("terminal states ignore the clock", () => {
+    expect(indicatorElapsed({ kind: "achieved", elapsedMs: 9000 }, 0, 0, 10 ** 9)).toBe(9000);
+    expect(
+      indicatorLabel({ kind: "achieved", condition: "c", turnsEvaluated: 3, tokensSpent: 9 }, 0),
+    ).toBe("[goal] achieved: c — 3 turn(s), 9 tokens");
+    expect(indicatorLabel({ kind: "failed", condition: "c", lastReason: "nope" }, 0)).toBe(
+      "[goal] failed: c — nope",
+    );
+  });
+
+  test("none renders nothing", () => {
+    expect(indicatorLabel({ kind: "none" }, 0)).toBe("");
+  });
+
+  test("a dormant active goal is coloured as a warning, not as info", () => {
+    expect(statusColourKind(running)).toBe("active");
+    expect(statusColourKind(paused)).toBe("paused");
+    expect(statusColourKind({ kind: "none" })).toBe("active");
+    expect(statusColour(theme, "paused")).toBe("#ffff00");
+    expect(statusColour(theme, "active")).toBe("#0000ff");
   });
 });

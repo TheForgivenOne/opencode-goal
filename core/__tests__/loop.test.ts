@@ -17,6 +17,7 @@ import {
   newConversationWarning,
   permissiveRefusalWarning,
   permissiveWarning,
+  resumeGoal,
   stopSessionForNewConversation,
   waitForTurnEnd,
 } from "../loop";
@@ -48,6 +49,8 @@ function fakeDeps(seed: Record<string, unknown> = {}) {
         synthetic: async ({ text }: { text: string }) => {
           synthetics.push(text);
         },
+        // Never settles, so a run started in a test stays live: the loop parks here.
+        wait: () => new Promise<void>(() => {}),
       },
     },
     rootDir: "/tmp/opencode/goal-test-root",
@@ -59,6 +62,8 @@ describe("stopSessionForNewConversation (AC-13)", () => {
   it("stops the loop but KEEPS the goal — a new conversation must not delete it", async () => {
     const S = "ses_regression";
     const { deps, map, synthetics } = fakeDeps({ [goalKey(S)]: encode(createGoal("keep going")) });
+    resumeGoal(S, "attach", deps);
+    expect(hasActiveRun(S)).toBe(true);
 
     await stopSessionForNewConversation(S, deps);
 
@@ -72,8 +77,30 @@ describe("stopSessionForNewConversation (AC-13)", () => {
   it("announces the pause with the shared message text", async () => {
     const S = "ses_notice";
     const { deps, synthetics } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    resumeGoal(S, "attach", deps);
     await stopSessionForNewConversation(S, deps);
     expect(synthetics).toEqual([`Goal warning: ${newConversationWarning()}`]);
+  });
+
+  // The watchers are registered once per plugin load, so one `session.created` reaches
+  // this several times. Live: SEVEN identical notices. Only the call that actually
+  // stopped a loop may announce it.
+  it("announces the pause ONCE, not once per plugin load", async () => {
+    const S = "ses_dup_notice";
+    const { deps, synthetics } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    resumeGoal(S, "attach", deps);
+    await Promise.all(
+      Array.from({ length: 7 }, () => stopSessionForNewConversation(S, deps)),
+    );
+    expect(synthetics.filter((text) => text.includes("a new conversation started"))).toHaveLength(1);
+  });
+
+  it("does not re-announce a goal that was already dormant", async () => {
+    const S = "ses_already_paused";
+    const { deps, synthetics } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    // No run started: the goal is set but dormant, so its pause was already reported.
+    await stopSessionForNewConversation(S, deps);
+    expect(synthetics).toEqual([]);
   });
 
   it("stays silent when there is no goal", async () => {

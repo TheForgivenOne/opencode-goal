@@ -182,12 +182,19 @@ function isCurrentRun(sessionID: string, run: RunState): boolean {
   return runs.get(sessionID) === run;
 }
 
-/** Abort and forget a session's run. The in-flight turn is not interrupted. */
-function abortRun(sessionID: string): void {
+/**
+ * Abort and forget a session's run. The in-flight turn is not interrupted.
+ *
+ * Returns whether a run was actually stopped. That is what lets a caller announce a
+ * stop exactly once: the watchers are registered once per plugin load, so a single
+ * `session.created` reaches them several times (live: **seven** identical notices).
+ */
+function abortRun(sessionID: string): boolean {
   const run = runs.get(sessionID);
-  if (run === undefined) return;
+  if (run === undefined) return false;
   runs.delete(sessionID);
   run.abort.abort();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,9 +338,14 @@ export async function stopSessionForNewConversation(
   sessionID: string,
   deps: GoalLoopDeps,
 ): Promise<void> {
-  abortRun(sessionID);
+  const hadRun = abortRun(sessionID);
   const { record } = await readGoal(sessionID, deps.ctx);
   if (record === null || !isActive(record)) return;
+  // Only the call that actually stopped a loop announces it. The watchers are
+  // registered once per plugin load, so one `session.created` reaches this several
+  // times; the rest find the goal already paused and would repeat the same line.
+  // Live report: seven identical "a new conversation started" notices.
+  if (!hadRun) return;
   await warn(deps, sessionID, newConversationWarning());
 }
 
@@ -478,6 +490,16 @@ async function driveLoop(
         await emitTerminal(deps, sessionID, record, verdict);
         break;
       }
+
+      // REQ-12 (§6.3): the indicator holds no goal truth — it re-reads on `changed`,
+      // and `changed` was emitted only at goal set, clear and terminal. So the counts
+      // sat frozen at "turn 0, 0 tokens" for an entire run (live report). Announce
+      // progress at every non-terminal verdict.
+      deps.notify?.changed?.({
+        sessionID,
+        kind: "active",
+        condition: record.condition,
+      });
 
       // Anti-spin (AC-30/31/32).
       if (record.consecutiveNoToolTurns >= cfg.antiSpinThreshold) {

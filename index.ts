@@ -48,6 +48,7 @@
 import {
   abortAll,
   clearGoal,
+  hasActiveRun,
   noteHumanPrompt,
   notePermissionAsk,
   noteToolUse,
@@ -282,7 +283,15 @@ export default {
             state: record.state,
           };
           if (record.state === "active") {
-            return { kind: "active" as const, ...base, elapsedMs: now - record.setAt };
+            return {
+              kind: "active" as const,
+              ...base,
+              // §6.3: `active` is the goal, `running` is the loop. They differ whenever
+              // the loop has stopped but the goal remains set (new conversation, anti-spin,
+              // turn cap, kill switch) — without this the indicator cannot say "paused".
+              running: hasActiveRun(input.sessionID),
+              elapsedMs: now - record.setAt,
+            };
           }
           return {
             kind: record.state === "achieved" ? ("achieved" as const) : ("failed" as const),

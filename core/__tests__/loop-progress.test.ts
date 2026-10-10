@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { resumeGoal, type GoalLoopDeps, type LoopNotifications } from "../loop";
+import { _getReArmCount, resumeGoal, type GoalLoopDeps, type LoopNotifications } from "../loop";
 import { createGoal, encode } from "../record";
 import { goalKey } from "../store";
 
@@ -129,5 +129,61 @@ describe("loop progress notifications (§6.3)", () => {
     expect(changed.some((entry) => entry.kind === "achieved")).toBe(true);
     // The non-terminal announcement must not fire for a terminal verdict.
     expect(changed.filter((entry) => entry.kind === "active")).toHaveLength(0);
+  });
+});
+
+/**
+ * Auto-resume: an active goal that the loop drops for a *transient* reason
+ * re-arms on its own. This drives a real infrastructure failure (the evaluator
+ * throws a non-unusable error) and checks the re-arm budget was consumed.
+ *
+ * Without the fix, `turnsEvaluated` sits still and the user has to send a
+ * message to resume — the reported "not logical" behaviour.
+ */
+describe("auto-resume after an infrastructure failure", () => {
+  it("increments the re-arm counter when the evaluator fails for an infra reason", async () => {
+    const S = "ses_auto_infra";
+    const { deps, emitted } = fakeDeps();
+    // A non-unusable error (ECONNRESET-shaped) must NOT be treated as a
+    // candidate failure; it propagates to the loop's catch and stops the run.
+    deps.ctx.session.generate = async () => {
+      throw new Error("ECONNRESET: socket closed");
+    };
+    await deps.ctx.storage.set(goalKey(S), encode(createGoal("keep going")) as never);
+
+    resumeGoal(S, "prompt", deps);
+    // Wait for the loop to stop (the evaluation failure warning is emitted).
+    await waitFor(() => emitted.some((line) => line.includes("evaluation failed")));
+
+    // The goal is still active, so the loop scheduled a re-arm.
+    expect(_getReArmCount(S)).toBe(1);
+  });
+
+  it("does NOT re-arm after a terminal verdict (the goal is resolved)", async () => {
+    const S = "ses_auto_terminal";
+    const { deps, changed } = fakeDeps();
+    deps.ctx.session.generate = async () => ({ text: "MET: done." });
+    await deps.ctx.storage.set(goalKey(S), encode(createGoal("keep going")) as never);
+
+    resumeGoal(S, "prompt", deps);
+    await waitFor(() => changed.some((entry) => entry.kind === "achieved"));
+
+    expect(_getReArmCount(S)).toBe(0);
+  });
+
+  it("does NOT re-arm after a clear (the user chose to stop)", async () => {
+    const S = "ses_auto_clear";
+    const { deps, emitted } = fakeDeps();
+    deps.ctx.session.generate = async () => {
+      throw new Error("ECONNRESET: socket closed");
+    };
+    await deps.ctx.storage.set(goalKey(S), encode(createGoal("keep going")) as never);
+
+    resumeGoal(S, "prompt", deps);
+    await waitFor(() => emitted.some((line) => line.includes("evaluation failed")));
+    // The re-arm is scheduled, but the user clears before it fires.
+    const { clearGoal } = await import("../loop");
+    await clearGoal(S, deps);
+    expect(_getReArmCount(S)).toBe(0);
   });
 });

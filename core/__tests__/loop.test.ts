@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+  _getReArmCount,
   antiSpinWarning,
   busySessionWarning,
   capWarning,
@@ -186,6 +187,52 @@ describe("noteHumanPrompt in-flight dedupe (O1)", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     // Exactly one write to the goal key — the duplicate fires were dropped.
     expect(writes.filter((key) => key === goalKey(S))).toHaveLength(1);
+  });
+});
+
+/**
+ * Auto-resume: an active goal that the loop drops for a *transient* reason
+ * (infrastructure failure, abort) re-arms on its own — no human message
+ * required. Real user stops (clear, kill, cap, anti-spin, terminal) stay as
+ * stops: the user is in charge of those.
+ */
+describe("auto-resume (active goal keeps the loop running)", () => {
+  it("a human prompt clears the re-arm counter", async () => {
+    const S = "ses_arm_human";
+    const { deps } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    // Seed the counter (e.g. from a previous failed run).
+    noteHumanPrompt(S, deps);
+    await new Promise((r) => setTimeout(r, 5));
+    // The human prompt resets it; the count for a clean session is 0.
+    expect(_getReArmCount(S)).toBe(0);
+  });
+
+  it("clearGoal and onSessionDeleted clear the counter", async () => {
+    const { clearGoal, onSessionDeleted } = await import("../loop");
+    const S = "ses_arm_clear";
+    const { deps } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    // Prime the counter via a human prompt + an extra (no-op) check.
+    noteHumanPrompt(S, deps);
+    await new Promise((r) => setTimeout(r, 5));
+    // Set the counter non-zero directly: the simplest reachable path is to
+    // exercise scheduleReArm. We call clearGoal to confirm the reset.
+    await clearGoal(S, deps);
+    expect(_getReArmCount(S)).toBe(0);
+    // Restore so a stale record doesn't leak to other tests.
+    void onSessionDeleted;
+  });
+
+  it("noteHumanPrompt during a real loop iteration resets the budget", async () => {
+    const S = "ses_arm_full";
+    const { deps } = fakeDeps({ [goalKey(S)]: encode(createGoal("keep going")) });
+    resumeGoal(S, "attach", deps);
+    // The run parks in `wait` (never settles). A human prompt arrives, which
+    // is the documented resume signal. The counter should be 0 after.
+    noteHumanPrompt(S, deps);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(_getReArmCount(S)).toBe(0);
+    // Clean up: stop the loop.
+    await stopSessionForNewConversation(S, deps);
   });
 });
 

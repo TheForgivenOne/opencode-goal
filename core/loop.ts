@@ -198,6 +198,88 @@ function abortRun(sessionID: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-resume: the user set the goal, the loop should keep working on it
+// without a human poke. Real user stops (clear, kill, cap, anti-spin) still
+// hold; transient stops (infra failure, abort) re-arm after a short delay.
+// ---------------------------------------------------------------------------
+
+/** Delay before an auto-resume fires (the time we let a transient settle). */
+const RE_ARM_DELAY_MS = 5000;
+/** Maximum consecutive re-arms before we require a human prompt to continue. */
+const RE_ARM_MAX = 5;
+/** Process-wide counter of consecutive re-arms per session, for the upper bound. */
+const reArmCounts = sharedMap<string, number>("goalReArmCounts");
+
+/** Reset the re-arm counter for a session (user typed, or goal cleared). */
+function clearReArmCount(sessionID: string): void {
+  reArmCounts.delete(sessionID);
+}
+
+/** Test hook: read the current re-arm counter for a session. */
+export function _getReArmCount(sessionID: string): number {
+  return reArmCounts.get(sessionID) ?? 0;
+}
+
+/**
+ * Schedule an auto-resume. The body of the timer is locked and re-reads the
+ * goal so a clear that landed in the meantime is honoured.
+ *
+ * The cap is checked *twice*: once here (in case the loop that just stopped had
+ * already burned the cap) and again inside the timer (in case the user raised
+ * it). A persistent failure (the evaluator keeps erroring) is bounded by
+ * `RE_ARM_MAX`: the user gets a clear "send a message to continue" line rather
+ * than a tight loop of "loop started, loop failed, loop started…".
+ */
+function scheduleReArm(
+  sessionID: string,
+  deps: GoalLoopDeps,
+  reason: "infra" | "abort",
+  turnsThisRun: number,
+): void {
+  const count = (reArmCounts.get(sessionID) ?? 0) + 1;
+  reArmCounts.set(sessionID, count);
+  if (count > RE_ARM_MAX) {
+    void warn(deps, sessionID, reArmLimitWarning(RE_ARM_MAX));
+    return;
+  }
+  const cfg = resolveConfig(deps.rootDir, deps.pluginOptions).config;
+  if (turnsThisRun >= cfg.turnCap) return;
+  setTimeout(() => {
+    void withSessionLock(sessionID, async () => {
+      const { record } = await readGoal(sessionID, deps.ctx);
+      if (record === null || !isActive(record)) {
+        clearReArmCount(sessionID);
+        return;
+      }
+      const cfgNow = resolveConfig(deps.rootDir, deps.pluginOptions).config;
+      if (record.turnsThisRun >= cfgNow.turnCap) {
+        clearReArmCount(sessionID);
+        return;
+      }
+      await emitSynthetic(
+        deps,
+        sessionID,
+        `Goal loop auto-resumed after ${reason === "infra" ? "an evaluator failure" : "an interrupt"}.`,
+      );
+      resumeGoal(sessionID, "prompt", deps);
+    }).catch(() => {
+      // Watcher-triggered work must never surface an error.
+    });
+  }, RE_ARM_DELAY_MS);
+}
+
+/** Why a loop iteration stopped. Drives the re-arm decision. */
+type LoopStopReason =
+  | "unknown"
+  | "kill"
+  | "cap"
+  | "infra"
+  | "abort"
+  | "cleared"
+  | "terminal"
+  | "antiSpin";
+
+// ---------------------------------------------------------------------------
 // Watcher ingress (called by index.ts, which owns the watcher wiring)
 // ---------------------------------------------------------------------------
 
@@ -260,6 +342,9 @@ export function noteHumanPrompt(sessionID: string, deps: GoalLoopDeps): void {
       if (current.size === 0) humanPromptInFlight.delete("sessions");
     }
   });
+  // A human prompt indicates the user is back at the keyboard; reset the
+  // auto-resume budget so the next transient gets a fresh allowance.
+  clearReArmCount(sessionID);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +371,9 @@ export async function startGoal(
     const now = deps.now?.() ?? Date.now();
     const record = createGoal(condition, now);
     await persist(sessionID, record, deps);
+
+    // A fresh goal is a fresh re-arm budget.
+    clearReArmCount(sessionID);
 
     await emitSynthetic(deps, sessionID, `Goal set: ${condition}`);
     deps.notify?.changed?.({ sessionID, kind: "active", condition });
@@ -346,6 +434,7 @@ export async function clearGoal(
   return withSessionLock(sessionID, async () => {
     const { record } = await readGoal(sessionID, deps.ctx);
     abortRun(sessionID);
+    clearReArmCount(sessionID);
     if (record === null) return { cleared: false };
 
     await persistDelete(sessionID, deps);
@@ -402,6 +491,7 @@ export async function onSessionDeleted(
 ): Promise<void> {
   await withSessionLock(sessionID, async () => {
     abortRun(sessionID);
+    clearReArmCount(sessionID);
     await persistDelete(sessionID, deps);
     await removeEvaluatorSession(sessionID, deps.ctx);
   });
@@ -418,21 +508,36 @@ async function driveLoop(
   run: RunState,
 ): Promise<void> {
   let record: GoalRecord | null = null;
+  // Why the loop ended, used to decide whether to auto-resume in the `finally`.
+  // Defaults to "unknown" so any path that forgets to set it skips the re-arm.
+  let stopReason: LoopStopReason = "unknown";
 
   try {
     // A scheduled loop may start after a replacement already aborted this run.
-    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) return;
+    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+      stopReason = "abort";
+      return;
+    }
 
     const initial = await readGoal(sessionID, deps.ctx);
     record = initial.record;
-    if (record === null || !isActive(record)) return;
+    if (record === null || !isActive(record)) {
+      stopReason = "cleared";
+      return;
+    }
 
     // Re-check after the read: a replacement/clear during it must not let this
     // superseded loop write.
-    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) return;
+    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+      stopReason = "abort";
+      return;
+    }
 
     run.tokenBaseline = await readSessionTokens(sessionID, deps.ctx);
-    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) return;
+    if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+      stopReason = "abort";
+      return;
+    }
 
     if (mode === "prompt") {
       // The loop starts this turn (AC-17): it counts toward the cap (AC-34).
@@ -442,7 +547,10 @@ async function driveLoop(
       startTurn(run);
       run.phase = "prompting";
       await injectDirective(deps, sessionID, buildDirective(record));
-      if (!isCurrentRun(sessionID, run)) return;
+      if (!isCurrentRun(sessionID, run)) {
+        stopReason = "abort";
+        return;
+      }
     } else {
       // A human turn is already running; the loop starts none (E5).
       run.turnStartedByLoop = false;
@@ -453,6 +561,7 @@ async function driveLoop(
       // §8.5 out-of-band stop, checked before every wait. Independent of the evaluator.
       if (outOfBandStop(deps)) {
         await warn(deps, sessionID, KILL_SENTINEL_WARNING);
+        stopReason = "kill";
         break;
       }
 
@@ -461,6 +570,7 @@ async function driveLoop(
       if (run.permissionMode === "permissive") {
         if (gateCfg.permissiveModePolicy === "refuse") {
           await warn(deps, sessionID, permissiveRefusalWarning());
+          stopReason = "cleared"; // the goal is intentionally not re-armed after a refusal
           break;
         }
         if (!run.warnedPermissive) {
@@ -477,7 +587,10 @@ async function driveLoop(
       run.phase = "waiting";
       const turnWaitMaxMs = resolveConfig(deps.rootDir, deps.pluginOptions).config.turnWaitMaxMs;
       const waitOutcome = await waitForTurnEnd(deps, sessionID, run.abort.signal, turnWaitMaxMs);
-      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) break;
+      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+        stopReason = "abort";
+        break;
+      }
       if (waitOutcome === "timeout" && !run.warnedBusy) {
         run.warnedBusy = true;
         await warn(deps, sessionID, busySessionWarning(turnWaitMaxMs));
@@ -485,7 +598,11 @@ async function driveLoop(
 
       // Authoritative read at the turn boundary.
       const read = await readGoal(sessionID, deps.ctx);
-      if (read.record === null || !isActive(read.record)) break; // cleared/deleted mid-turn (E10, E13)
+      if (read.record === null || !isActive(read.record)) {
+        // cleared/deleted mid-turn (E10, E13)
+        stopReason = "cleared";
+        break;
+      }
       record = read.record;
 
       // Annotate: human-prompt scan resets counters (AC-33/AC-34); tool use is
@@ -496,6 +613,7 @@ async function driveLoop(
       const cfg = resolveConfig(deps.rootDir, deps.pluginOptions).config;
       if (record.turnsThisRun >= cfg.turnCap && run.turnStartedByLoop) {
         await warn(deps, sessionID, capWarning(cfg.turnCap));
+        stopReason = "cap";
         break;
       }
 
@@ -507,13 +625,18 @@ async function driveLoop(
           void emitSynthetic(deps, sessionID, `Goal warning: ${message}`);
         });
       } catch (err) {
-        // E8 / A-09: no further turn; goal stays active and dormant.
+        // E8 / A-09: an infrastructure failure stops the loop. The goal is still
+        // active, so the `finally` re-arms — that's the whole point of this fix.
         await warn(deps, sessionID, evaluationFailureWarning(err));
+        stopReason = "infra";
         break;
       }
 
       // E13: a verdict in flight must not re-activate a cleared goal.
-      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) break;
+      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+        stopReason = "abort";
+        break;
+      }
 
       // Annotate the evaluated turn for `applyVerdict`.
       verdict.toolUsedThisTurn = run.toolUsedThisTurn;
@@ -522,7 +645,10 @@ async function driveLoop(
 
       // Re-check after the token read: a clear/replacement during it must not let
       // a stale verdict be applied (E13).
-      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) break;
+      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+        stopReason = "abort";
+        break;
+      }
 
       // §8.6: a completed tool-using turn with no `permission.asked` is positive
       // evidence of permissive; with one, guarded. No tool use leaves it as-is.
@@ -536,6 +662,7 @@ async function driveLoop(
 
       if (verdict.kind !== "not-yet-met") {
         await emitTerminal(deps, sessionID, record, verdict);
+        stopReason = "terminal";
         break;
       }
 
@@ -549,13 +676,20 @@ async function driveLoop(
         condition: record.condition,
       });
 
-      // Anti-spin (AC-30/31/32).
+      // Anti-spin (AC-30/31/32). The user has set a goal; if the agent is stuck we
+      // want them to notice, not silently re-arm. The cap is the loop's bound on
+      // idle no-tool turns; if the agent can't make progress at all, the user
+      // clears and re-sets with a different prompt.
       if (record.consecutiveNoToolTurns >= cfg.antiSpinThreshold) {
         await warn(deps, sessionID, antiSpinWarning(cfg.antiSpinThreshold));
+        stopReason = "antiSpin";
         break;
       }
 
-      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) break;
+      if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) {
+        stopReason = "abort";
+        break;
+      }
 
       // Start the next turn (AC-16, AC-25).
       record = { ...record, turnsThisRun: record.turnsThisRun + 1 };
@@ -567,11 +701,26 @@ async function driveLoop(
     }
   } catch (err) {
     await safeWarn(deps, sessionID, unexpectedLoopWarning(err));
+    // An uncaught throw is treated like an infrastructure failure for re-arm
+    // purposes: the goal is still active, the cause is opaque, and the user
+    // didn't ask to stop.
+    if (stopReason === "unknown") stopReason = "infra";
   } finally {
     if (isCurrentRun(sessionID, run)) runs.delete(sessionID);
     if (record !== null && !isActive(record)) {
       // Resolved (met/impossible): the scratch session is no longer needed.
       await removeEvaluatorSession(sessionID, deps.ctx);
+    }
+    // Auto-resume: the user set the goal; if the loop ended for a transient
+    // reason (infra or abort) and the goal is still active, schedule a re-arm.
+    // Real user stops (clear, kill, cap, anti-spin, terminal) skip this and the
+    // user is in charge.
+    if (record !== null && isActive(record) && (stopReason === "infra" || stopReason === "abort")) {
+      scheduleReArm(sessionID, deps, stopReason, record.turnsThisRun);
+    } else if (record !== null && !isActive(record)) {
+      // Resolved: clear the re-arm counter so a future goal on this session
+      // starts from zero.
+      clearReArmCount(sessionID);
     }
   }
 }
@@ -758,6 +907,11 @@ export function busySessionWarning(maxMs: number): string {
 
 export function evaluationFailureWarning(err: unknown): string {
   return `Goal loop stopped: evaluation failed (${describeError(err)}). The goal remains set; send a message to resume.`;
+}
+
+/** Emitted when the auto-resume budget is exhausted and only a human can move it. */
+export function reArmLimitWarning(max: number): string {
+  return `Goal loop auto-resume limit reached (${max}). Send a message to continue.`;
 }
 
 export function permissiveWarning(): string {

@@ -15,6 +15,7 @@ import {
   hasActiveRun,
   KILL_SENTINEL_WARNING,
   newConversationWarning,
+  noteHumanPrompt,
   permissiveRefusalWarning,
   permissiveWarning,
   resumeGoal,
@@ -116,6 +117,75 @@ describe("stopSessionForNewConversation (AC-13)", () => {
     await stopSessionForNewConversation(S, deps);
     expect(JSON.parse(map.get(goalKey(S)) as string)).toEqual(record);
     expect(synthetics).toEqual([]);
+  });
+});
+
+/**
+ * R2: the per-session lock prevents a concurrent `noteHumanPrompt` and
+ * `stopSessionForNewConversation` from interleaving so a real human-prompt resume
+ * is silently dropped.
+ *
+ * Without the lock, `noteHumanPrompt`'s IIFE can reach its `runs.has` check
+ * *before* the stop's sync `abortRun` runs, see a run is still in flight, skip
+ * the resume, and the stop then deletes the run — leaving the goal paused with
+ * no loop. The fix wraps both bodies in `withSessionLock`, so they serialise and
+ * the second one always observes the first's effects.
+ */
+describe("concurrent stopSessionForNewConversation + noteHumanPrompt (R2)", () => {
+  it("the resume is never lost: the post-state is consistent", async () => {
+    const S = "ses_race";
+    const { deps, map, synthetics } = fakeDeps({
+      [goalKey(S)]: encode({ ...createGoal("keep going"), consecutiveNoToolTurns: 3, turnsThisRun: 4 }),
+    });
+    resumeGoal(S, "attach", deps);
+    expect(hasActiveRun(S)).toBe(true);
+
+    // Fire both at once. With the lock, one wins fully before the other starts.
+    await Promise.all([stopSessionForNewConversation(S, deps), noteHumanPrompt(S, deps)]);
+
+    // Whichever order: the record is still active, the resume counters are
+    // either reset (note won) or not (stop won), and exactly one announcement
+    // fired.
+    const record = JSON.parse(map.get(goalKey(S)) as string);
+    expect(record.state).toBe("active");
+    const notices = synthetics.filter((text) => text.includes("a new conversation started"));
+    expect(notices.length).toBeLessThanOrEqual(1);
+    // If note won, the run is alive and the counters are reset. If stop won, the
+    // run is gone. Both states are consistent with the contract.
+    if (record.consecutiveNoToolTurns === 0 && record.turnsThisRun === 0) {
+      expect(hasActiveRun(S)).toBe(true);
+      expect(notices).toHaveLength(0);
+    } else {
+      expect(hasActiveRun(S)).toBe(false);
+      expect(notices).toHaveLength(1);
+    }
+  });
+});
+
+/**
+ * O1: duplicate fires of the same human prompt are deduped, so the I/O cost is
+ * one read + one persist regardless of how many watcher instances fire.
+ * (Watchers are registered once per plugin load — 5× in this runtime — so a
+ * single user action reaches `noteHumanPrompt` several times.)
+ */
+describe("noteHumanPrompt in-flight dedupe (O1)", () => {
+  it("five duplicate fires do one read+persist, not five", async () => {
+    const S = "ses_dup";
+    const { deps, map } = fakeDeps({ [goalKey(S)]: encode(createGoal("c")) });
+    const writes: string[] = [];
+    const realSet = map.set.bind(map);
+    map.set = ((key: string, value: unknown) => {
+      writes.push(key);
+      return realSet(key, value);
+    }) as typeof map.set;
+    // No run: the in-flight IIFE's `if (!runs.has) resumeGoal` would try to
+    // start one. We want to test the dedupe, not the resume — so we stub the
+    // resume path by NOT starting a run and accepting the writes that follow.
+    for (let i = 0; i < 5; i++) noteHumanPrompt(S, deps);
+    // Wait for the in-flight to settle.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Exactly one write to the goal key — the duplicate fires were dropped.
+    expect(writes.filter((key) => key === goalKey(S))).toHaveLength(1);
   });
 });
 

@@ -90,3 +90,111 @@ export function forgetSessionInvocations(sessionID: string, keepKey?: string): v
     if (key !== keepKey && key.startsWith(prefix)) seen.delete(key);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Per-session async lock
+// ---------------------------------------------------------------------------
+
+/**
+ * Serialize session-mutating operations for one session ID, process-wide.
+ *
+ * **Why this exists.** `startGoal`, `clearGoal`, `noteHumanPrompt`,
+ * `stopSessionForNewConversation`, and `onSessionDeleted` all read the goal record,
+ * possibly write it, and consult or mutate the run registry. They fire from
+ * different events and are async, so two of them can interleave: a `noteHumanPrompt`
+ * IIFE can reach its `runs.has` check *before* a concurrent `stopSessionForNewConversation`
+ * calls `abortRun` (sync delete). When that happens, `noteHumanPrompt` thinks a run
+ * is still in flight and skips the resume; then the stop deletes the run; the user's
+ * "human prompt resumes" mental model is silently broken.
+ *
+ * The lock chains operations on the same `sessionID` so the next one observes the
+ * previous one's effects. Failures in one operation do not block the next (a rejected
+ * promise is replaced with `Promise.resolve()` before chaining), and the entry is
+ * removed when no one is waiting behind us so the map is bounded by active sessions.
+ *
+ * Operations that only do **sync** state — `noteToolUse`, `notePermissionAsk`,
+ * `abortAll` — do not need the lock; it is for read+write+`runs.has` chains.
+ */
+export async function withSessionLock<T>(
+  sessionID: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const locks = sharedMap<string, Promise<unknown>>("goalSessionLocks");
+  const previous = locks.get(sessionID) ?? Promise.resolve();
+  // Replace any rejection from the previous operation with a clean resolution so the
+  // next caller can run; the original error already surfaced to the previous caller.
+  const safePrevious = previous.catch(() => undefined);
+  const result = safePrevious.then(fn);
+  locks.set(sessionID, result);
+  try {
+    return await result;
+  } finally {
+    if (locks.get(sessionID) === result) locks.delete(sessionID);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluator model cache (process-wide)
+// ---------------------------------------------------------------------------
+
+/** A model reference. The cache is keyed by the joined id for set membership. */
+export interface ModelRef {
+  readonly providerID: string;
+  readonly modelID: string;
+}
+
+const modelRefId = (model: ModelRef): string => `${model.providerID}/${model.modelID}`;
+
+/**
+ * A process-wide cache of evaluator-model outcomes.
+ *
+ * The cost-ascending selector puts two unusable models first on this install
+ * (`muse-spark-1.2-contributor` and `muse-spark-1.3-contributor`, both `cost 0.2`).
+ * Every evaluation paid for them until `mimo-v2.6-flash` (the third candidate) was
+ * tried. With a live model that *is* usable, the right move is to remember it: try
+ * `lastGood` first, demote models we have *seen* fail to the back, and only fall
+ * through to the cost-ordered list when nothing else is available.
+ *
+ * The cache is **process-wide** because the failure mode is model-specific, not
+ * session-specific: a model that failed for session A will fail the same way for
+ * session B. A misclassification is recoverable — `noteModelSuccess` clears the
+ * unusable flag.
+ */
+const lastGoodModelStore = sharedMap<string, ModelRef | null>("goalLastGoodModel");
+const knownUnusableStore = sharedMap<string, Map<string, true>>("goalKnownUnusable");
+
+/** Record that `model` answered an evaluation successfully. */
+export function noteModelSuccess(model: ModelRef): void {
+  lastGoodModelStore.set("model", { providerID: model.providerID, modelID: model.modelID });
+  const set = knownUnusableStore.get("set");
+  if (set !== undefined && set.delete(modelRefId(model))) {
+    knownUnusableStore.set("set", set);
+  }
+}
+
+/** Record that `model` failed with an *unusable* error (retired, free-tier, opt-in, …). */
+export function noteModelUnusable(model: ModelRef): void {
+  const set = knownUnusableStore.get("set") ?? new Map<string, true>();
+  set.set(modelRefId(model), true);
+  knownUnusableStore.set("set", set);
+}
+
+/** The most recent model that answered an evaluation, or `null` if none yet. */
+export function getLastGoodModel(): ModelRef | null {
+  return lastGoodModelStore.get("model") ?? null;
+}
+
+/** True if `model` is in the process-wide known-unusable set. */
+export function isKnownUnusable(model: ModelRef): boolean {
+  return knownUnusableStore.get("set")?.has(modelRefId(model)) ?? false;
+}
+
+/**
+ * Drop the model cache. Tests use it; a config knob could too (e.g. after the user
+ * fixes a model setting). Clearing the cache forces the selector back to the
+ * cost-ordered list.
+ */
+export function clearModelCache(): void {
+  lastGoodModelStore.delete("model");
+  knownUnusableStore.delete("set");
+}

@@ -27,7 +27,7 @@
 import type { Plugin } from "@opencode/plugin";
 import { DEFAULT_CONFIG, type ResolvedConfig } from "./config";
 import { type GoalRecord, type Verdict, type VerdictKind } from "./record";
-import { sharedMap } from "./shared";
+import { sharedMap, getLastGoodModel, isKnownUnusable, noteModelSuccess, noteModelUnusable, type ModelRef } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Context slice
@@ -364,7 +364,37 @@ export function selectEvaluatorCandidates(
   // Prefer paid models; fall back to free ones only if that is all there is.
   // A missing cost is `Infinity` (see `outputCost`), so it counts as paid.
   const paid = sorted.filter((model) => outputCost(model) > 0);
-  const ordered = paid.length > 0 ? paid : sorted;
+  const paidSet = paid.length > 0 ? paid : sorted;
+
+  // Process-wide outcome cache: prefer the model that answered last time, demote
+  // models we have already seen fail with an *unusable* error. The cost ordering
+  // inside each bucket is preserved (stable sort). The cache is consulted here so
+  // every code path that walks candidates (this list, `selectEvaluatorModel`, the
+  // fallback walk in `evaluate`) sees the same ordering.
+  const lastGood = getLastGoodModel();
+  const usable = paidSet.filter(
+    (model) => !isKnownUnusable({ providerID: model.providerID, modelID: modelIdOf(model) }),
+  );
+  const unusable = paidSet.filter((model) =>
+    isKnownUnusable({ providerID: model.providerID, modelID: modelIdOf(model) }),
+  );
+  const pinned =
+    lastGood !== null
+      ? usable.filter(
+          (model) =>
+            model.providerID !== lastGood.providerID ||
+            modelIdOf(model) !== lastGood.modelID,
+        )
+      : usable;
+  const head =
+    lastGood !== null
+      ? paidSet.find(
+          (model) =>
+            model.providerID === lastGood.providerID &&
+            modelIdOf(model) === lastGood.modelID,
+        )
+      : undefined;
+  const ordered = head !== undefined ? [head, ...pinned, ...unusable] : [...pinned, ...unusable];
 
   return ordered.map((model) => ({ providerID: model.providerID, modelID: modelIdOf(model) }));
 }
@@ -687,12 +717,16 @@ export async function evaluate(
         prompt,
       });
       const parsed = parseVerdict(text);
+      // Record success: the next evaluation will try this model first.
+      noteModelSuccess(candidate as ModelRef);
       return { kind: parsed.kind, reason: parsed.reason };
     } catch (err) {
       // Only a model-unusable failure justifies trying the next candidate; any
       // other error (network, quota, malformed request) preserves E8 semantics.
       if (!isModelUnusableError(err)) throw err;
       lastError = err;
+      // Mark this model as unusable so the next evaluation starts past it.
+      noteModelUnusable(candidate as ModelRef);
       const next = attempts[i + 1];
       if (next !== undefined && onWarning !== undefined) {
         onWarning(

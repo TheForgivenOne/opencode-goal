@@ -31,6 +31,7 @@ import {
 } from "../evaluator";
 import type { ResolvedConfig } from "../config";
 import { createGoal } from "../record";
+import { clearModelCache, noteModelSuccess, noteModelUnusable } from "../shared";
 
 /** True if `s` contains an unpaired UTF-16 surrogate (i.e. a split code point). */
 function hasLoneSurrogate(s: string): boolean {
@@ -1096,5 +1097,63 @@ describe("evaluate — configured caps are used (spec §9)", () => {
     expect(prompt).toContain("NEWEST_SENTINEL");
     expect(prompt).not.toContain("OLDEST_SENTINEL");
     expect(prompt).toContain(TRANSCRIPT_TRUNCATION_MARKER);
+  });
+});
+
+/**
+ * Process-wide model cache wiring. The cost-ascending selector puts two
+ * unusable models first on this install; without a cache every evaluation pays
+ * for them. The cache: `lastGood` is tried first, `knownUnusable` is demoted.
+ */
+describe("selectEvaluatorCandidates — model cache", () => {
+  beforeEach(() => {
+    clearModelCache();
+  });
+
+  it("a successful model is tried first on the next selection", () => {
+    const models = [
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 1 }] }),
+      model({ providerID: "b", modelID: "mid", cost: [{ output: 5 }] }),
+    ];
+    expect(selectEvaluatorCandidates(models)[0]).toEqual({ providerID: "a", modelID: "cheap" });
+
+    noteModelSuccess({ providerID: "b", modelID: "mid" });
+    expect(selectEvaluatorCandidates(models)[0]).toEqual({ providerID: "b", modelID: "mid" });
+  });
+
+  it("a model known to be unusable is demoted to the back", () => {
+    const models = [
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 1 }] }),
+      model({ providerID: "b", modelID: "mid", cost: [{ output: 5 }] }),
+    ];
+    noteModelUnusable({ providerID: "a", modelID: "cheap" });
+    const ordered = selectEvaluatorCandidates(models).map((c) => c.modelID);
+    // Demoted, not removed: the cache is a hint (the model may recover), not absolute.
+    expect(ordered[ordered.length - 1]).toBe("cheap");
+    expect(ordered).toContain("mid");
+  });
+
+  it("lastGood and knownUnusable coexist: pinned first, then usable, then unusable", () => {
+    const models = [
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 1 }] }),
+      model({ providerID: "b", modelID: "mid", cost: [{ output: 5 }] }),
+      model({ providerID: "c", modelID: "pricey", cost: [{ output: 20 }] }),
+    ];
+    noteModelSuccess({ providerID: "c", modelID: "pricey" });
+    noteModelUnusable({ providerID: "a", modelID: "cheap" });
+    const ordered = selectEvaluatorCandidates(models).map((c) => c.modelID);
+    expect(ordered).toEqual(["pricey", "mid", "cheap"]);
+  });
+
+  it("clearing the cache returns to the cost-ordered list", () => {
+    const models = [
+      model({ providerID: "a", modelID: "cheap", cost: [{ output: 1 }] }),
+      model({ providerID: "b", modelID: "mid", cost: [{ output: 5 }] }),
+    ];
+    noteModelSuccess({ providerID: "b", modelID: "mid" });
+    noteModelUnusable({ providerID: "a", modelID: "cheap" });
+    expect(selectEvaluatorCandidates(models)[0]).toEqual({ providerID: "b", modelID: "mid" });
+    clearModelCache();
+    expect(selectEvaluatorCandidates(models)[0]).toEqual({ providerID: "a", modelID: "cheap" });
   });
 });

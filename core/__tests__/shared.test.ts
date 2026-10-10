@@ -8,7 +8,17 @@
  * (every evaluation doubled, two directives injected with no turn between them).
  */
 import { describe, expect, test } from "bun:test";
-import { forgetSessionInvocations, isDuplicateInvocation, sharedMap } from "../shared";
+import {
+  clearModelCache,
+  forgetSessionInvocations,
+  getLastGoodModel,
+  isDuplicateInvocation,
+  isKnownUnusable,
+  noteModelSuccess,
+  noteModelUnusable,
+  sharedMap,
+  withSessionLock,
+} from "../shared";
 
 const host = globalThis as unknown as Record<string, unknown>;
 
@@ -118,5 +128,114 @@ describe("isDuplicateInvocation", () => {
     expect(isDuplicateInvocation("dedupe-b\u0000/goal x", 2000, 1000)).toBe(false);
     forgetSessionInvocations("dedupe-a");
     expect(isDuplicateInvocation("dedupe-b\u0000/goal x", 2000, 1010)).toBe(true);
+  });
+});
+
+/**
+ * Per-session async lock. The session-mutating entry points (`startGoal`,
+ * `clearGoal`, `noteHumanPrompt`, `stopSessionForNewConversation`,
+ * `onSessionDeleted`) wrap their bodies in `withSessionLock`, so a concurrent
+ * `noteHumanPrompt` and `stopSessionForNewConversation` observe each other's
+ * effects. The bug this closes: `noteHumanPrompt`'s IIFE reached its `runs.has`
+ * check *before* a concurrent stop's `abortRun` (sync delete) ran, so the resume
+ * was skipped and the goal was left paused with no loop running (R2 in the
+ * 2026-10-10 review).
+ */
+describe("withSessionLock", () => {
+  test("runs the body and returns its value", async () => {
+    const out = await withSessionLock("ses_basic", async () => 42);
+    expect(out).toBe(42);
+  });
+
+  test("serialises two operations on the same session id", async () => {
+    const order: string[] = [];
+    const op = async (id: string, delay: number): Promise<void> => {
+      await withSessionLock("ses_order", async () => {
+        order.push(`${id}:start`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        order.push(`${id}:end`);
+      });
+    };
+    await Promise.all([op("a", 30), op("b", 0)]);
+    // The lock is FIFO, so the slower one starts first.
+    expect(order).toEqual(["a:start", "a:end", "b:start", "b:end"]);
+  });
+
+  test("isolation: different session ids run in parallel", async () => {
+    const order: string[] = [];
+    const op = (id: string, delay: number): Promise<void> =>
+      withSessionLock(id, async () => {
+        order.push(`${id}:start`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        order.push(`${id}:end`);
+      });
+    await Promise.all([op("ses_x", 30), op("ses_y", 0)]);
+    // No order across sessions — they are independent.
+    expect(order).toContain("ses_x:start");
+    expect(order).toContain("ses_y:start");
+    expect(order.filter((entry) => entry.endsWith(":end"))).toHaveLength(2);
+  });
+
+  // A rejection in one operation must not block the next caller. The error
+  // already surfaced to the original caller; the lock just makes the chain
+  // available again.
+  test("a rejection does not block the next caller", async () => {
+    await expect(
+      withSessionLock("ses_rej", async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    const out = await withSessionLock("ses_rej", async () => "ok");
+    expect(out).toBe("ok");
+  });
+
+  test("the lock entry is removed once the chain is empty", async () => {
+    await withSessionLock("ses_cleanup", async () => undefined);
+    const locks = sharedMap<string, Promise<unknown>>("goalSessionLocks");
+    expect(locks.has("ses_cleanup")).toBe(false);
+  });
+});
+
+/**
+ * Process-wide evaluator model cache. The cost-ascending selector puts two
+ * unusable models first on this install; without a cache, every evaluation pays
+ * for them. `lastGood` short-circuits the next one; `knownUnusable` demotes
+ * models we have already seen fail.
+ */
+describe("evaluator model cache", () => {
+  test("starts empty: no last good, nothing known unusable", () => {
+    clearModelCache();
+    expect(getLastGoodModel()).toBeNull();
+    expect(isKnownUnusable({ providerID: "p", modelID: "m" })).toBe(false);
+  });
+
+  test("noteModelSuccess records the model and clears any unusable flag", () => {
+    clearModelCache();
+    const m = { providerID: "p", modelID: "m" };
+    noteModelUnusable(m);
+    expect(isKnownUnusable(m)).toBe(true);
+    noteModelSuccess(m);
+    expect(getLastGoodModel()).toEqual(m);
+    expect(isKnownUnusable(m)).toBe(false);
+  });
+
+  test("noteModelSuccess overwrites a previous last good", () => {
+    clearModelCache();
+    noteModelSuccess({ providerID: "p", modelID: "a" });
+    noteModelSuccess({ providerID: "p", modelID: "b" });
+    expect(getLastGoodModel()).toEqual({ providerID: "p", modelID: "b" });
+  });
+
+  test("isKnownUnusable tracks each model independently", () => {
+    clearModelCache();
+    noteModelUnusable({ providerID: "p", modelID: "a" });
+    expect(isKnownUnusable({ providerID: "p", modelID: "a" })).toBe(true);
+    expect(isKnownUnusable({ providerID: "p", modelID: "b" })).toBe(false);
+  });
+
+  test("the cache is process-wide (visible through a second lookup)", () => {
+    clearModelCache();
+    noteModelSuccess({ providerID: "p", modelID: "m" });
+    expect(getLastGoodModel()).toEqual({ providerID: "p", modelID: "m" });
   });
 });

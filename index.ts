@@ -248,20 +248,29 @@ export default {
 
     let rpcRegistration: RpcRegistration<typeof portableGoalRpc> | undefined;
 
-    // RPC emissions are best-effort: a failed emit must never affect the loop.
+    // RPC emissions are best-effort: a failed emit must never affect the loop, but
+    // a silent swallow hides the TUI falling behind. Log and continue.
     const notify: LoopNotifications = {
       changed: (payload) => {
         try {
-          void rpcRegistration?.events.emit("changed", payload)?.catch?.(() => {});
-        } catch {
-          // Best effort.
+          void rpcRegistration?.events
+            .emit("changed", payload)
+            ?.catch?.((err: unknown) => {
+              console.warn("[goal] failed to emit changed event:", err);
+            });
+        } catch (err) {
+          console.warn("[goal] failed to emit changed event:", err);
         }
       },
       warning: (payload) => {
         try {
-          void rpcRegistration?.events.emit("warning", payload)?.catch?.(() => {});
-        } catch {
-          // Best effort.
+          void rpcRegistration?.events
+            .emit("warning", payload)
+            ?.catch?.((err: unknown) => {
+              console.warn("[goal] failed to emit warning event:", err);
+            });
+        } catch (err) {
+          console.warn("[goal] failed to emit warning event:", err);
         }
       },
     };

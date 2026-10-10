@@ -33,7 +33,7 @@ import {
   type ConfigLoadResult,
   type RawConfig,
 } from "./config";
-import { sharedMap } from "./shared";
+import { sharedMap, withSessionLock } from "./shared";
 import {
   crossProviderWarning,
   evaluate,
@@ -214,11 +214,29 @@ export function notePermissionAsk(sessionID: string): void {
 }
 
 /**
+ * Per-session "a noteHumanPrompt reset is in flight" guard.
+ *
+ * Watchers are registered once per plugin load (5× in this runtime), so the same
+ * human prompt event reaches this function several times. The session lock already
+ * serialises the bodies, but a single in-flight promise is cheaper than N
+ * round-trips: subsequent calls see the in-flight entry and return without doing
+ * any I/O at all. The entry is cleared when the work resolves (success or fail).
+ */
+const humanPromptInFlight = sharedMap<string, Map<string, Promise<void>>>("goalHumanPromptInFlight");
+
+/**
  * A human `"user"` inbox item (AC-33/E14). Resets the run counters and, when the
  * loop is dormant, resumes evaluation in attach mode.
+ *
+ * Body is wrapped in {@link withSessionLock} so it serialises against
+ * `startGoal`/`clearGoal`/`stopSessionForNewConversation`/`onSessionDeleted` for
+ * the same session (the TOCTOU that lost a human-prompt resume on 2026-10-10).
  */
 export function noteHumanPrompt(sessionID: string, deps: GoalLoopDeps): void {
-  void (async () => {
+  const inFlight = humanPromptInFlight.get("sessions");
+  if (inFlight?.has(sessionID) === true) return; // dedupe duplicate fires
+
+  const work = withSessionLock(sessionID, async () => {
     const { record } = await readGoal(sessionID, deps.ctx);
     if (record === null || !isActive(record)) return;
     const reset: GoalRecord = {
@@ -228,8 +246,19 @@ export function noteHumanPrompt(sessionID: string, deps: GoalLoopDeps): void {
     };
     await persist(sessionID, reset, deps);
     if (!runs.has(sessionID)) resumeGoal(sessionID, "attach", deps);
-  })().catch(() => {
+  }).catch(() => {
     // A watcher-triggered resume must never surface an error.
+  });
+
+  const set = inFlight ?? new Map<string, Promise<void>>();
+  set.set(sessionID, work);
+  humanPromptInFlight.set("sessions", set);
+  void work.finally(() => {
+    const current = humanPromptInFlight.get("sessions");
+    if (current !== undefined) {
+      current.delete(sessionID);
+      if (current.size === 0) humanPromptInFlight.delete("sessions");
+    }
   });
 }
 
@@ -240,27 +269,33 @@ export function noteHumanPrompt(sessionID: string, deps: GoalLoopDeps): void {
 /**
  * Set a goal and start its loop immediately (AC-17). Replaces any existing goal
  * in the session, aborting its loop first (AC-3/AC-4).
+ *
+ * Wrapped in {@link withSessionLock} so a concurrent `noteHumanPrompt` or
+ * `stopSessionForNewConversation` cannot race the abort / write / resume sequence
+ * (R2/R3 in the 2026-10-10 review).
  */
 export async function startGoal(
   sessionID: string,
   condition: string,
   deps: GoalLoopDeps,
 ): Promise<void> {
-  // AC-4: terminate the previous loop (not just its display) before starting one.
-  abortRun(sessionID);
+  await withSessionLock(sessionID, async () => {
+    // AC-4: terminate the previous loop (not just its display) before starting one.
+    abortRun(sessionID);
 
-  const now = deps.now?.() ?? Date.now();
-  const record = createGoal(condition, now);
-  await persist(sessionID, record, deps);
+    const now = deps.now?.() ?? Date.now();
+    const record = createGoal(condition, now);
+    await persist(sessionID, record, deps);
 
-  await emitSynthetic(deps, sessionID, `Goal set: ${condition}`);
-  deps.notify?.changed?.({ sessionID, kind: "active", condition });
+    await emitSynthetic(deps, sessionID, `Goal set: ${condition}`);
+    deps.notify?.changed?.({ sessionID, kind: "active", condition });
 
-  await emitProviderWarning(sessionID, deps);
-  await emitConfigWarnings(sessionID, deps);
+    await emitProviderWarning(sessionID, deps);
+    await emitConfigWarnings(sessionID, deps);
 
-  // §8.6 gate at goal set: a fresh goal is `unknown`, which proceeds.
-  resumeGoal(sessionID, "prompt", deps);
+    // §8.6 gate at goal set: a fresh goal is `unknown`, which proceeds.
+    resumeGoal(sessionID, "prompt", deps);
+  });
 }
 
 /**
@@ -300,20 +335,25 @@ export function resumeGoal(
  * Clear the goal (AC-9..AC-12, AC-35). Deletes the record, aborts the loop, and
  * removes the scratch evaluator session. The in-flight turn finishes; no further
  * turn starts.
+ *
+ * Locked: a clear in flight must finish before a concurrent `noteHumanPrompt` or
+ * `startGoal` reads the (now-absent) record.
  */
 export async function clearGoal(
   sessionID: string,
   deps: GoalLoopDeps,
 ): Promise<{ cleared: boolean; condition?: string }> {
-  const { record } = await readGoal(sessionID, deps.ctx);
-  abortRun(sessionID);
-  if (record === null) return { cleared: false };
+  return withSessionLock(sessionID, async () => {
+    const { record } = await readGoal(sessionID, deps.ctx);
+    abortRun(sessionID);
+    if (record === null) return { cleared: false };
 
-  await persistDelete(sessionID, deps);
-  const warning = await removeEvaluatorSession(sessionID, deps.ctx);
-  if (warning !== undefined) deps.notify?.warning?.({ sessionID, reason: warning });
-  deps.notify?.changed?.({ sessionID, kind: "none", condition: record.condition });
-  return { cleared: true, condition: record.condition };
+    await persistDelete(sessionID, deps);
+    const warning = await removeEvaluatorSession(sessionID, deps.ctx);
+    if (warning !== undefined) deps.notify?.warning?.({ sessionID, reason: warning });
+    deps.notify?.changed?.({ sessionID, kind: "none", condition: record.condition });
+    return { cleared: true, condition: record.condition };
+  });
 }
 
 /** Abort every live loop (plugin unload / reload, E11). Starts no further turn. */
@@ -333,30 +373,38 @@ export function abortAll(): void {
  * disappears, it is not persisting". The trigger is now root-sessions-only in
  * `watch.ts`, and here the stop leaves the goal set but dormant, exactly like every
  * other non-user stop, and says so. A human prompt resumes it (`noteHumanPrompt`).
+ *
+ * Locked: without it, a concurrent `noteHumanPrompt` could see a run that this
+ * function is about to delete, skip its resume, and leave the goal paused with no
+ * loop running (R2 in the 2026-10-10 review).
  */
 export async function stopSessionForNewConversation(
   sessionID: string,
   deps: GoalLoopDeps,
 ): Promise<void> {
-  const hadRun = abortRun(sessionID);
-  const { record } = await readGoal(sessionID, deps.ctx);
-  if (record === null || !isActive(record)) return;
-  // Only the call that actually stopped a loop announces it. The watchers are
-  // registered once per plugin load, so one `session.created` reaches this several
-  // times; the rest find the goal already paused and would repeat the same line.
-  // Live report: seven identical "a new conversation started" notices.
-  if (!hadRun) return;
-  await warn(deps, sessionID, newConversationWarning());
+  await withSessionLock(sessionID, async () => {
+    const hadRun = abortRun(sessionID);
+    const { record } = await readGoal(sessionID, deps.ctx);
+    if (record === null || !isActive(record)) return;
+    // Only the call that actually stopped a loop announces it. The watchers are
+    // registered once per plugin load, so one `session.created` reaches this several
+    // times; the rest find the goal already paused and would repeat the same line.
+    // Live report: seven identical "a new conversation started" notices.
+    if (!hadRun) return;
+    await warn(deps, sessionID, newConversationWarning());
+  });
 }
 
-/** E10: session deleted — stop the loop and expire the terminal record. */
+/** E10: session deleted — stop the loop and expire the terminal record. Locked for symmetry. */
 export async function onSessionDeleted(
   sessionID: string,
   deps: GoalLoopDeps,
 ): Promise<void> {
-  abortRun(sessionID);
-  await persistDelete(sessionID, deps);
-  await removeEvaluatorSession(sessionID, deps.ctx);
+  await withSessionLock(sessionID, async () => {
+    abortRun(sessionID);
+    await persistDelete(sessionID, deps);
+    await removeEvaluatorSession(sessionID, deps.ctx);
+  });
 }
 
 // ---------------------------------------------------------------------------

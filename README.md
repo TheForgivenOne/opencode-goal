@@ -88,11 +88,17 @@ turns is **not** impossible — the loop accumulates work across turns.
 | anti-spin | N turns in a row with **no tool call at all** | stops, goal stays set |
 | turn cap | N turns started by the loop | stops, goal stays set |
 | `/goal clear` | you ask | goal removed |
+| new conversation | you open another session | stops, goal stays set |
 | kill switch | `OPENCODE_GOAL_DISABLE=1` or `.opencode/goal.kill` | stops, goal stays set |
 | evaluator failure | transport or unexpected error | stops, goal stays set |
 
 Every stop except the first **leaves the goal set but dormant** — your next
-message resumes it.
+message resumes it. That includes opening a new conversation: the loop stops so
+it cannot keep working in a session you have left, but the goal you set is still
+there when you come back to it.
+
+Only a root session counts as a new conversation — a subagent or other
+programmatic child session does not disturb your goal.
 
 ## Configuration
 

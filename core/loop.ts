@@ -313,14 +313,25 @@ export function abortAll(): void {
 }
 
 /**
- * AC-13: a new conversation removes the previously-viewed session's goal and
- * stops its loop. Called by `index.ts` from the watcher's new-conversation signal.
+ * AC-13: a new conversation stops the previously-viewed session's loop.
+ *
+ * It must **not** delete the goal. Until 2026-10-10 this called `clearGoal`, and a
+ * live session showed what that cost: `session.created` also fires for programmatic
+ * sessions (subagent/task sessions carry `parentID`; see `watch.ts` G-1), so any
+ * session creation — a subagent, an API client, a probe — silently removed the goal
+ * of the session the user was working in. That is the reported "the goal just
+ * disappears, it is not persisting". The trigger is now root-sessions-only in
+ * `watch.ts`, and here the stop leaves the goal set but dormant, exactly like every
+ * other non-user stop, and says so. A human prompt resumes it (`noteHumanPrompt`).
  */
 export async function stopSessionForNewConversation(
   sessionID: string,
   deps: GoalLoopDeps,
 ): Promise<void> {
-  await clearGoal(sessionID, deps);
+  abortRun(sessionID);
+  const { record } = await readGoal(sessionID, deps.ctx);
+  if (record === null || !isActive(record)) return;
+  await warn(deps, sessionID, newConversationWarning());
 }
 
 /** E10: session deleted — stop the loop and expire the terminal record. */
@@ -577,6 +588,11 @@ export function capWarning(turnCap: number): string {
 
 export function antiSpinWarning(threshold: number): string {
   return `Goal loop stopped: no tool use across ${threshold} consecutive turns. The goal remains set; send a message to resume.`;
+}
+
+/** AC-13: a new conversation paused the goal (root sessions only; see `watch.ts`). */
+export function newConversationWarning(): string {
+  return "Goal loop stopped: a new conversation started. The goal remains set; send a message to resume.";
 }
 
 export function evaluationFailureWarning(err: unknown): string {

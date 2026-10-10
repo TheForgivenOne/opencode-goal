@@ -9,7 +9,8 @@
  *    so a `"user"` inbox item is a human turn;
  *  - **session deletion** — `session.deleted` (E10);
  *  - **new conversation** — `session.created` while a previously-viewed session is
- *    known (AC-13/REQ-10), with the plugin's own scratch evaluator sessions excluded;
+ *    known (AC-13/REQ-10), excluding the plugin's own scratch evaluator sessions and
+ *    any child/subagent session (a root session only — see G-1 below);
  *  - **`permission.asked`** for the §8.6 permissive-mode inference.
  *
  * A subscriber that throws breaks the event pipeline (project spike). Every
@@ -108,6 +109,13 @@ export function installWatchers(
 
       case "session.created": {
         if (isScratchSessionTitle(event.data.title)) return;
+        // G-1, resolved 2026-10-10. `session.created` fires for *programmatic*
+        // session creation too, not only for a user's new conversation. A subagent
+        // or task session carries `parentID`; it is not a new conversation, and
+        // treating it as one stopped the goal of the session the user was working
+        // in. Observed live: creating one session (by any means) removed the goal of
+        // the session being viewed. Only a root session counts as a new conversation.
+        if (event.data.parentID !== undefined) return;
         const previous = lastViewedSessionID;
         const created = event.data.sessionID;
         // Only a genuine new-conversation event stops the previously-viewed loop.

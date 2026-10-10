@@ -31,3 +31,42 @@ export function sharedMap<K, V>(name: string): Map<K, V> {
   host[key] = created;
   return created;
 }
+
+/**
+ * How long one invocation is considered a duplicate of itself, in ms. The observed
+ * duplicate arrived ~50 ms after the first; a second is generous and still far
+ * shorter than a human can retype a command deliberately.
+ */
+export const INVOCATION_DEDUPE_MS = 2000;
+
+/**
+ * Collapse duplicate invocations of one user action, **process-wide**.
+ *
+ * Because the entrypoint is loaded several times per server process (see above),
+ * the `/goal` command handler is registered several times and a single invocation
+ * runs it more than once. A live session shows the cost: `Goal set: inspect` twice,
+ * ~50 ms apart, each with its own directive — the second `startGoal` aborts the run
+ * the first just started and rewrites the record, resetting `turnsThisRun`. Gating
+ * on the run registry does not work: the duplicate calls arrive while the first is
+ * still awaiting, and the registry is populated later.
+ *
+ * Returns `true` when `key` was seen within `windowMs`, recording `key` either way.
+ * Callers key on the invocation itself (session + raw command text), so a different
+ * argument is never suppressed: `/goal a` followed by `/goal b` still ends up as `b`.
+ * `now` is injectable so the window is testable without sleeping.
+ */
+export function isDuplicateInvocation(
+  key: string,
+  windowMs: number,
+  now: number = Date.now(),
+): boolean {
+  const seen = sharedMap<string, number>("invocations");
+  const previous = seen.get(key);
+  seen.set(key, now);
+  if (seen.size > 64) {
+    for (const [candidate, at] of seen) {
+      if (now - at > windowMs) seen.delete(candidate);
+    }
+  }
+  return previous !== undefined && now - previous <= windowMs;
+}

@@ -19,11 +19,14 @@ import {
   TRANSCRIPT_TOTAL_MIN,
   TURN_CAP_MAX,
   TURN_CAP_MIN,
+  TURN_WAIT_MAX,
+  TURN_WAIT_MIN,
 } from "../config";
 
 const DOCUMENTED_DEFAULT = {
   antiSpinThreshold: 10,
   turnCap: 50,
+  turnWaitMaxMs: 120_000,
   evaluatorModel: undefined,
   permissiveModePolicy: "warn",
   transcriptMaxMessageChars: 8000,
@@ -128,6 +131,7 @@ describe("valid values are accepted silently (AC-38)", () => {
     const { config, warnings } = loadConfig({
       antiSpinThreshold: 25,
       turnCap: 500,
+      turnWaitMaxMs: 45_000,
       evaluatorModel: "x/y",
       permissiveModePolicy: "refuse",
       transcriptMaxMessageChars: 1000,
@@ -137,6 +141,7 @@ describe("valid values are accepted silently (AC-38)", () => {
     expect(config).toEqual({
       antiSpinThreshold: 25,
       turnCap: 500,
+      turnWaitMaxMs: 45_000,
       evaluatorModel: "x/y",
       permissiveModePolicy: "refuse",
       transcriptMaxMessageChars: 1000,
@@ -565,5 +570,56 @@ describe("null on each of the three new keys is present-and-invalid (review find
     expect(config.evaluatorMaxAttempts).toBe(5);
     expect(warnings).toHaveLength(3);
     for (const warning of warnings) expect(warning).toContain("null");
+  });
+});
+
+/**
+ * `turnWaitMaxMs` bounds the turn-end wait (§4.2). `ctx.session.wait` resolves at
+ * *global* loop idle, so a session the human keeps working in never goes idle and
+ * the loop wedged there with no verdict (a live session: 12+ minutes).
+ */
+describe("turnWaitMaxMs (§4.2)", () => {
+  test("defaults to two minutes", () => {
+    expect(loadConfig(undefined).config.turnWaitMaxMs).toBe(120_000);
+    expect(DEFAULT_CONFIG.turnWaitMaxMs).toBe(120_000);
+  });
+
+  test("0 is valid and means 'wait indefinitely' — the escape hatch back to the old behaviour", () => {
+    const { config, warnings } = loadConfig({ turnWaitMaxMs: 0 });
+    expect(config.turnWaitMaxMs).toBe(0);
+    expect(warnings).toEqual([]);
+    expect(TURN_WAIT_MIN).toBe(0);
+  });
+
+  test("out of range → default plus a warning naming the value", () => {
+    const { config, warnings } = loadConfig({ turnWaitMaxMs: TURN_WAIT_MAX + 1 });
+    expect(config.turnWaitMaxMs).toBe(120_000);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("turnWaitMaxMs");
+  });
+
+  test("null is present-and-invalid, not absent", () => {
+    const { config, warnings } = loadConfig({ turnWaitMaxMs: null });
+    expect(config.turnWaitMaxMs).toBe(120_000);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("null");
+  });
+
+  test("accepted from every layer, with the environment winning", () => {
+    const { config } = resolveConfigFrom({
+      options: { turnWaitMaxMs: 30_000 },
+      file: { turnWaitMaxMs: 60_000 },
+      env: { OPENCODE_GOAL_TURN_WAIT: "90000" },
+    });
+    expect(config.turnWaitMaxMs).toBe(90_000);
+  });
+
+  test("an invalid environment override does not erase a valid lower layer", () => {
+    const { config, warnings } = resolveConfigFrom({
+      file: { turnWaitMaxMs: 60_000 },
+      env: { OPENCODE_GOAL_TURN_WAIT: "soon" },
+    });
+    expect(config.turnWaitMaxMs).toBe(60_000);
+    expect(warnings.some((warning) => warning.includes("OPENCODE_GOAL_TURN_WAIT"))).toBe(true);
   });
 });

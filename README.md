@@ -124,6 +124,7 @@ Precedence, lowest to highest:
 {
   "antiSpinThreshold": 10,
   "turnCap": 50,
+  "turnWaitMaxMs": 120000,
   "evaluatorModel": "anthropic/claude-haiku",
   "permissiveModePolicy": "warn",
   "transcriptMaxMessageChars": 8000,
@@ -136,13 +137,14 @@ Precedence, lowest to highest:
 |---|---|---|
 | `antiSpinThreshold` | `10` | Consecutive **no-tool** turns before the loop stops |
 | `turnCap` | `50` | Unattended turns per run before the loop stops |
+| `turnWaitMaxMs` | `120000` | Longest one turn-end wait may block, in ms; `0` waits indefinitely |
 | `evaluatorModel` | auto | `provider/model` for judging; unset picks one automatically |
 | `permissiveModePolicy` | `"warn"` | `"warn"` or `"refuse"` when a permissive mode is inferred |
 | `transcriptMaxMessageChars` | `8000` | Per-message transcript cap sent to the evaluator |
 | `transcriptMaxTotalChars` | `48000` | Total transcript budget per evaluation |
 | `evaluatorMaxAttempts` | `5` | Model candidates one evaluation may try |
 
-Environment overrides: `OPENCODE_GOAL_ANTISPIN`, `OPENCODE_GOAL_TURNCAP`,
+Environment overrides: `OPENCODE_GOAL_ANTISPIN`, `OPENCODE_GOAL_TURNCAP`, `OPENCODE_GOAL_TURN_WAIT`,
 `OPENCODE_GOAL_EVAL_MODEL`, `OPENCODE_GOAL_PERMISSIVE`,
 `OPENCODE_GOAL_TRANSCRIPT_MESSAGE`, `OPENCODE_GOAL_TRANSCRIPT_TOTAL`,
 `OPENCODE_GOAL_EVAL_ATTEMPTS`.

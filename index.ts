@@ -72,6 +72,7 @@ import {
 } from "./core/parser";
 import { readGoal, scanGoals } from "./core/store";
 import { installWatchers, type WatchContext } from "./core/watch";
+import { INVOCATION_DEDUPE_MS, isDuplicateInvocation } from "./core/shared";
 
 import type { Plugin } from "@opencode/plugin";
 import type { RpcRegistration } from "@opencode/plugin/promise/rpc";
@@ -357,6 +358,19 @@ export default {
 
           // G-4: tolerate either reading of `prompt.text`.
           const arg = stripCommandToken(invocation.prompt?.text ?? "");
+
+          // One `/goal` invocation can reach this handler more than once, because
+          // the entrypoint is loaded several times per server process (see
+          // `core/shared.ts`). A live session shows the cost: `Goal set: inspect`
+          // twice, ~50 ms apart, each with its own directive, the second aborting
+          // and rewriting the record the first created. Collapse duplicates of the
+          // *same* invocation; a different argument is never suppressed, so
+          // `/goal a` then `/goal b` still applies `b`.
+          const invocationKey = `${sessionID}\u0000${invocation.prompt?.text ?? ""}`;
+          if (isDuplicateInvocation(invocationKey, INVOCATION_DEDUPE_MS)) {
+            return;
+          }
+
           const parsed = parseGoalArg(arg);
 
           switch (parsed.kind) {

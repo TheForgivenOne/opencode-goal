@@ -582,6 +582,7 @@ describe("resolveEvaluatorModel (spec §7.2 rules 1–3)", () => {
   const cfg = (over: Partial<ResolvedConfig> = {}): ResolvedConfig => ({
     antiSpinThreshold: 3,
     turnCap: 50,
+    turnWaitMaxMs: 120_000,
     evaluatorModel: undefined,
     permissiveModePolicy: "warn",
     transcriptMaxMessageChars: 8000,
@@ -780,6 +781,7 @@ describe("evaluate (spec §7, AC-20/AC-21/AC-28)", () => {
     const cfg: ResolvedConfig = {
       antiSpinThreshold: 3,
       turnCap: 50,
+      turnWaitMaxMs: 120_000,
       evaluatorModel: undefined,
       permissiveModePolicy: "warn",
       transcriptMaxMessageChars: 8000,
@@ -808,6 +810,7 @@ describe("evaluate — fall back to the next candidate on an unusable model", ()
   const cfg: ResolvedConfig = {
     antiSpinThreshold: 3,
     turnCap: 50,
+    turnWaitMaxMs: 120_000,
     evaluatorModel: undefined,
     permissiveModePolicy: "warn",
     transcriptMaxMessageChars: 8000,
@@ -1007,6 +1010,7 @@ describe("evaluate — configured caps are used (spec §9)", () => {
   const baseCfg: ResolvedConfig = {
     antiSpinThreshold: 3,
     turnCap: 50,
+    turnWaitMaxMs: 120_000,
     evaluatorModel: undefined,
     permissiveModePolicy: "warn",
     transcriptMaxMessageChars: 8000,

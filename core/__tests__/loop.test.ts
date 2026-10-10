@@ -7,7 +7,19 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { hasActiveRun, newConversationWarning, stopSessionForNewConversation } from "../loop";
+import {
+  antiSpinWarning,
+  busySessionWarning,
+  capWarning,
+  evaluationFailureWarning,
+  hasActiveRun,
+  KILL_SENTINEL_WARNING,
+  newConversationWarning,
+  permissiveRefusalWarning,
+  permissiveWarning,
+  stopSessionForNewConversation,
+  waitForTurnEnd,
+} from "../loop";
 import { createGoal, encode } from "../record";
 import { goalKey } from "../store";
 
@@ -77,5 +89,102 @@ describe("stopSessionForNewConversation (AC-13)", () => {
     await stopSessionForNewConversation(S, deps);
     expect(JSON.parse(map.get(goalKey(S)) as string)).toEqual(record);
     expect(synthetics).toEqual([]);
+  });
+});
+
+/**
+ * §4.2 turn-end wait.
+ *
+ * `ctx.session.wait` resolves at **global** loop idle, not at the end of the loop's
+ * own turn. While the loop drives the session that is correct; the moment a human
+ * works in the same session it is wrong, because the session never goes idle — a
+ * live session shows the loop blocked there for 12+ minutes with `turnsEvaluated`
+ * and `tokensSpent` both stuck at 0. `wait` takes `RequestOptions.signal`, so the
+ * wait is capped and a run abort cancels it.
+ */
+describe("waitForTurnEnd (§4.2)", () => {
+  /** A `wait` that honours the abort signal the way the real (fetch-backed) one does. */
+  function signalAwareWait() {
+    const seen: { signal?: AbortSignal } = {};
+    const wait = (_input: unknown, options?: { signal?: AbortSignal }): Promise<void> => {
+      seen.signal = options?.signal;
+      return new Promise<void>((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new Error("AbortError")), {
+          once: true,
+        });
+      });
+    };
+    return { wait, seen };
+  }
+
+  function waitDeps(wait: (input: unknown, options?: { signal?: AbortSignal }) => Promise<void>) {
+    return { ctx: { session: { wait } }, rootDir: "/tmp/opencode/goal-test-root" } as never;
+  }
+
+  it("returns idle when the session does go idle", async () => {
+    const deps = waitDeps(async () => {});
+    expect(await waitForTurnEnd(deps, "ses_idle", new AbortController().signal, 1000)).toBe("idle");
+  });
+
+  it("caps the wait: a session that never goes idle returns timeout rather than hanging", async () => {
+    const { wait, seen } = signalAwareWait();
+    const started = Date.now();
+    const outcome = await waitForTurnEnd(waitDeps(wait), "ses_busy", new AbortController().signal, 40);
+    expect(outcome).toBe("timeout");
+    expect(Date.now() - started).toBeLessThan(1000); // bounded, not wedged
+    expect(seen.signal?.aborted).toBe(true); // and the in-flight request was cancelled
+  });
+
+  it("returns aborted when the run is aborted mid-wait, so /goal clear takes effect", async () => {
+    const { wait } = signalAwareWait();
+    const run = new AbortController();
+    const pending = waitForTurnEnd(waitDeps(wait), "ses_abort", run.signal, 60_000);
+    run.abort();
+    expect(await pending).toBe("aborted");
+  });
+
+  it("turnWaitMaxMs 0 restores the unbounded wait", async () => {
+    const deps = waitDeps(async () => {});
+    expect(await waitForTurnEnd(deps, "ses_unbounded", new AbortController().signal, 0)).toBe("idle");
+  });
+
+  it("a genuine wait error still propagates, so the E8 failure path handles it", async () => {
+    const deps = waitDeps(async () => {
+      throw new Error("transport down");
+    });
+    await expect(
+      waitForTurnEnd(deps, "ses_err", new AbortController().signal, 1000),
+    ).rejects.toThrow("transport down");
+  });
+});
+
+/**
+ * `warn()` prepends `Goal warning: ` to whatever a builder returns, so a builder
+ * that returns it too produces `Goal warning: Goal warning: …`. Observed live on
+ * 2026-10-10 for the busy-session warning; the permissive warning had carried the
+ * same defect since it was written.
+ */
+describe("warning builders return the reason only — warn() adds the prefix", () => {
+  const builders: Array<[string, string]> = [
+    ["KILL_SENTINEL_WARNING", KILL_SENTINEL_WARNING],
+    ["capWarning", capWarning(50)],
+    ["antiSpinWarning", antiSpinWarning(10)],
+    ["newConversationWarning", newConversationWarning()],
+    ["busySessionWarning", busySessionWarning(120_000)],
+    ["permissiveWarning", permissiveWarning()],
+    ["permissiveRefusalWarning", permissiveRefusalWarning()],
+    ["evaluationFailureWarning", evaluationFailureWarning(new Error("x"))],
+  ];
+
+  it("none of them repeats the prefix", () => {
+    const offenders = builders
+      .filter(([, text]) => text.startsWith("Goal warning: "))
+      .map(([name]) => name);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the busy warning names the cap and the key to change it", () => {
+    expect(busySessionWarning(120_000)).toContain("120s");
+    expect(busySessionWarning(120_000)).toContain("turnWaitMaxMs");
   });
 });

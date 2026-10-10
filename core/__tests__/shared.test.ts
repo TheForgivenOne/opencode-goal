@@ -8,7 +8,7 @@
  * (every evaluation doubled, two directives injected with no turn between them).
  */
 import { describe, expect, test } from "bun:test";
-import { sharedMap } from "../shared";
+import { isDuplicateInvocation, sharedMap } from "../shared";
 
 const host = globalThis as unknown as Record<string, unknown>;
 
@@ -47,5 +47,39 @@ describe("sharedMap", () => {
     const map = sharedMap<string, string>(name);
     expect(map).toBeInstanceOf(Map);
     expect(host[`__opencodeGoalShared__${name}`]).toBe(map);
+  });
+});
+
+/**
+ * The `/goal` command handler is registered once per plugin load, so a single
+ * invocation runs it several times. A live session shows the cost: `Goal set:
+ * inspect` twice, ~50 ms apart, each with its own directive.
+ */
+describe("isDuplicateInvocation", () => {
+  test("first sight is not a duplicate; the immediate repeat is", () => {
+    expect(isDuplicateInvocation("dedupe-basic", 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation("dedupe-basic", 2000, 1050)).toBe(true); // ~50 ms, as observed
+  });
+
+  test("outside the window is a fresh invocation again", () => {
+    expect(isDuplicateInvocation("dedupe-window", 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation("dedupe-window", 2000, 3001)).toBe(false);
+  });
+
+  test("the window is inclusive at its boundary", () => {
+    expect(isDuplicateInvocation("dedupe-boundary", 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation("dedupe-boundary", 2000, 3000)).toBe(true);
+  });
+
+  test("a different key is never suppressed, so `/goal a` then `/goal b` applies b", () => {
+    expect(isDuplicateInvocation("dedupe-ses\u0000/goal a", 2000, 1000)).toBe(false);
+    expect(isDuplicateInvocation("dedupe-ses\u0000/goal b", 2000, 1010)).toBe(false);
+  });
+
+  test("state is process-wide, so a second plugin load sees the first's record", () => {
+    const key = "dedupe-cross-instance";
+    expect(isDuplicateInvocation(key, 2000, 1000)).toBe(false);
+    expect(sharedMap<string, number>("invocations").has(key)).toBe(true);
+    expect(isDuplicateInvocation(key, 2000, 1010)).toBe(true);
   });
 });

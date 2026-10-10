@@ -126,6 +126,8 @@ interface RunState {
   permissionMode: PermissionMode;
   /** Emit the permissive warning once per run. */
   warnedPermissive: boolean;
+  /** Emit the busy-session warning once per run (§4.2). */
+  warnedBusy: boolean;
   /** Working-turn token watermark (cumulative `SessionInfo.tokens`). */
   tokenBaseline: number;
   /** Newest transcript message time seen at the last evaluation. */
@@ -277,6 +279,7 @@ export function resumeGoal(
     permissionAskedThisTurn: false,
     permissionMode: "unknown",
     warnedPermissive: false,
+    warnedBusy: false,
     tokenBaseline: 0,
     lastEvalMessageTime: deps.now?.() ?? Date.now(),
   };
@@ -406,10 +409,19 @@ async function driveLoop(
         }
       }
 
-      // Turn end.
+      // Turn end (§4.2). Bounded: `wait` returns at *global* loop idle, so a
+      // session the human keeps working in may never go idle — a live session
+      // shows the loop blocked there for 12+ minutes with no verdict and no
+      // counters moving. `wait` accepts an AbortSignal, so the wait is capped
+      // (and a run abort cancels it) and the turn is evaluated as it stands.
       run.phase = "waiting";
-      await deps.ctx.session.wait({ sessionID });
+      const turnWaitMaxMs = resolveConfig(deps.rootDir, deps.pluginOptions).config.turnWaitMaxMs;
+      const waitOutcome = await waitForTurnEnd(deps, sessionID, run.abort.signal, turnWaitMaxMs);
       if (run.abort.signal.aborted || !isCurrentRun(sessionID, run)) break;
+      if (waitOutcome === "timeout" && !run.warnedBusy) {
+        run.warnedBusy = true;
+        await warn(deps, sessionID, busySessionWarning(turnWaitMaxMs));
+      }
 
       // Authoritative read at the turn boundary.
       const read = await readGoal(sessionID, deps.ctx);
@@ -497,6 +509,69 @@ async function driveLoop(
 function startTurn(run: RunState): void {
   run.toolUsedThisTurn = false;
   run.permissionAskedThisTurn = false;
+}
+
+/**
+ * Wait for the turn to end, but never longer than `maxMs` (§4.2).
+ *
+ * `ctx.session.wait` resolves when the session's agent loop becomes **idle** — not
+ * when the loop's own turn ends. That is the right signal while the loop drives the
+ * session and the wrong one the moment a human works in the same session: the
+ * session never goes idle, so the wait never returns, no verdict is reached, and
+ * `turnsEvaluated`/`tokensSpent` stay at zero. Nothing else can observe an abort
+ * either, because every abort check sits *after* this await — a live session shows
+ * a loop wedged here for 12+ minutes while the user worked.
+ *
+ * `wait` takes `RequestOptions.signal`, so the wait is raced against a timer and the
+ * request is aborted when the timer wins. The race is deliberate belt-and-braces: if
+ * a runtime ignored the signal, the race would still return and the loop would still
+ * make progress. `maxMs <= 0` restores the unbounded wait.
+ *
+ * Returns `"idle"` (normal turn end), `"timeout"` (cap reached) or `"aborted"` (the
+ * run was aborted). A genuine wait error is rethrown so the §8/E8 failure path still
+ * handles it.
+ *
+ * Exported for tests (the `wait` seam is otherwise unreachable without a live
+ * session); it is not part of the module's public contract.
+ */
+export async function waitForTurnEnd(
+  deps: GoalLoopDeps,
+  sessionID: string,
+  runAbort: AbortSignal,
+  maxMs: number,
+): Promise<"idle" | "timeout" | "aborted"> {
+  if (maxMs <= 0) {
+    await deps.ctx.session.wait({ sessionID });
+    return runAbort.aborted ? "aborted" : "idle";
+  }
+
+  const controller = new AbortController();
+  const onRunAbort = (): void => controller.abort();
+  runAbort.addEventListener("abort", onRunAbort, { once: true });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), maxMs);
+  });
+
+  const waited = deps.ctx.session
+    .wait({ sessionID }, { signal: controller.signal })
+    .then(() => "idle" as const)
+    .catch((error: unknown) => {
+      if (runAbort.aborted) return "aborted" as const;
+      throw error;
+    });
+
+  try {
+    const outcome = await Promise.race([waited, timedOut]);
+    // Cancel the request when the cap wins. The race already holds a handler for
+    // `waited`, so a late rejection cannot surface as unhandled.
+    if (outcome === "timeout") controller.abort();
+    return outcome;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    runAbort.removeEventListener("abort", onRunAbort);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,12 +670,20 @@ export function newConversationWarning(): string {
   return "Goal loop stopped: a new conversation started. The goal remains set; send a message to resume.";
 }
 
+/**
+ * §4.2: the turn-end wait hit its cap. Not a stop — the turn is evaluated as it
+ * stands and the loop continues — so this says what happened, not what ended.
+ */
+export function busySessionWarning(maxMs: number): string {
+  return `the session did not go idle within ${Math.round(maxMs / 1000)}s, so the turn was evaluated as it stands. Raise or disable turnWaitMaxMs to change this.`;
+}
+
 export function evaluationFailureWarning(err: unknown): string {
   return `Goal loop stopped: evaluation failed (${describeError(err)}). The goal remains set; send a message to resume.`;
 }
 
 export function permissiveWarning(): string {
-  return "Goal warning: this session appears to be in a permissive/auto-approve mode. /goal is a pacing feature, not a sandbox — unattended tool execution may occur.";
+  return "this session appears to be in a permissive/auto-approve mode. /goal is a pacing feature, not a sandbox — unattended tool execution may occur.";
 }
 
 export function permissiveRefusalWarning(): string {

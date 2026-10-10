@@ -28,6 +28,11 @@ export interface ResolvedConfig {
   antiSpinThreshold: number;
   /** Loop-started turns per unattended run before the hard cap stops the loop. */
   turnCap: number;
+  /**
+   * Longest one turn-end wait may block, in ms (spec §4.2). `0` waits
+   * indefinitely, which is the behaviour that wedged a live loop (see §4.2).
+   */
+  turnWaitMaxMs: number;
   /** Model id for evaluation; `undefined` means auto-select (spec §7.2). */
   evaluatorModel?: string;
   /** Response to a positively-inferred permissive mode (spec §8.6). */
@@ -48,6 +53,7 @@ export interface ConfigLoadResult {
 export interface RawConfig {
   antiSpinThreshold?: unknown;
   turnCap?: unknown;
+  turnWaitMaxMs?: unknown;
   evaluatorModel?: unknown;
   permissiveModePolicy?: unknown;
   transcriptMaxMessageChars?: unknown;
@@ -58,6 +64,7 @@ export interface RawConfig {
 export const DEFAULT_CONFIG: Readonly<ResolvedConfig> = Object.freeze({
   antiSpinThreshold: 10,
   turnCap: 50,
+  turnWaitMaxMs: 120_000,
   evaluatorModel: undefined,
   permissiveModePolicy: "warn",
   transcriptMaxMessageChars: 8000,
@@ -70,6 +77,14 @@ export const ANTI_SPIN_MIN = 1;
 export const ANTI_SPIN_MAX = 25;
 export const TURN_CAP_MIN = 1;
 export const TURN_CAP_MAX = 500;
+/**
+ * Turn-end wait bound, in ms. `ctx.session.wait` returns at *global* loop idle,
+ * so a session the human keeps working in may never go idle; the bound is what
+ * stops the loop from wedging with no verdict and no counters moving. `0`
+ * restores the unbounded wait.
+ */
+export const TURN_WAIT_MIN = 0;
+export const TURN_WAIT_MAX = 3_600_000;
 /** Transcript caps bound evaluator cost/egress per evaluation, so they are tunable. */
 export const TRANSCRIPT_MESSAGE_MIN = 200;
 export const TRANSCRIPT_MESSAGE_MAX = 200_000;
@@ -147,6 +162,14 @@ export function loadConfig(raw: RawConfig | null | undefined): ConfigLoadResult 
       warnings,
     ),
     evaluatorModel: readEvaluatorModel(source.evaluatorModel, warnings),
+    turnWaitMaxMs: readInteger(
+      source.turnWaitMaxMs,
+      TURN_WAIT_MIN,
+      TURN_WAIT_MAX,
+      DEFAULT_CONFIG.turnWaitMaxMs,
+      "turnWaitMaxMs",
+      warnings,
+    ),
     permissiveModePolicy: readPermissivePolicy(source.permissiveModePolicy, warnings),
     transcriptMaxMessageChars: readInteger(
       source.transcriptMaxMessageChars,
@@ -223,6 +246,7 @@ const KEY_SPECS: readonly {
 }[] = [
   { key: "antiSpinThreshold", accept: acceptInteger(ANTI_SPIN_MIN, ANTI_SPIN_MAX) },
   { key: "turnCap", accept: acceptInteger(TURN_CAP_MIN, TURN_CAP_MAX) },
+  { key: "turnWaitMaxMs", accept: acceptInteger(TURN_WAIT_MIN, TURN_WAIT_MAX) },
   { key: "evaluatorModel", accept: acceptModelId },
   { key: "permissiveModePolicy", accept: acceptPolicy },
   {
@@ -268,6 +292,7 @@ function specFor(key: keyof RawConfig) {
 const ENV_NAMES: Readonly<Record<string, keyof RawConfig>> = {
   OPENCODE_GOAL_ANTISPIN: "antiSpinThreshold",
   OPENCODE_GOAL_TURNCAP: "turnCap",
+  OPENCODE_GOAL_TURN_WAIT: "turnWaitMaxMs",
   OPENCODE_GOAL_EVAL_MODEL: "evaluatorModel",
   OPENCODE_GOAL_PERMISSIVE: "permissiveModePolicy",
   OPENCODE_GOAL_TRANSCRIPT_MESSAGE: "transcriptMaxMessageChars",
